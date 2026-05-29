@@ -1,0 +1,22 @@
+# Ambientes virtuais
+.venv/
+venv/
+ENV/
+
+# Caches e Python temporários
+__pycache__/
+*.py[cod]
+*$py.class
+.pytest_cache/
+.mypy_cache/
+
+# Arquivos de distribuição e dados locais
+dist/
+build/
+*.egg-info/
+*.parquet
+logus_colab.ipynb
+
+# IDEs
+.vscode/
+.idea/

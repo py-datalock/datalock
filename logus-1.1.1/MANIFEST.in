@@ -1,0 +1,4 @@
+include CHANGELOG.md
+recursive-include logus *.py py.typed
+recursive-exclude tests *
+global-exclude *.py[cod] __pycache__ *~

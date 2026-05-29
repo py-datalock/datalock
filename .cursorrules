@@ -1,0 +1,45 @@
+# datalock — Cursor IDE Rules (v1.0.1)
+# Renamed from logus-lgpd. .lgs files → .dlk format.
+
+## Import
+```python
+import datalock as dd
+import os
+SALT = os.environ["DATALOCK_SALT"]
+KEY  = os.environ["DATALOCK_KEY"]
+# import logus as lg  ← also works (backward compat)
+```
+
+## Quick patterns
+read any file:          `df = dd.read("file.csv")`
+filter rows:            `df = dd.where(df, uf="SP")`
+add column:             `df = dd.add_column(df, taxa=dd.col("renda")*0.27)`
+detect PII:             `reports = dd.scan(df)`
+mask PII:               `df_safe = dd.mask(df, salt=SALT)`
+save encrypted:         `dd.store(df_safe, "out.dlk", key=KEY)`
+read encrypted:         `df = dd.read("out.dlk", key=KEY)`
+canary tracing:         `dd.store(df, "out.dlk", key=KEY, canary=True)`
+mask text:              `dd.mask_text(text, salt=SALT, strategy="semantic")`
+scan dir:               `inv = dd.scan_directory("./data/")`
+full pipeline:          `result = dd.process("in.csv", salt=SALT, key=KEY, output="out.dlk")`
+
+## Type rules
+- dd.mask(pd.DataFrame) → pd.DataFrame
+- dd.mask(pl.DataFrame) → pl.DataFrame
+- dd.mask(pl.LazyFrame) → pl.LazyFrame
+- ALL manipulation functions preserve input type
+
+## Never do
+- open("file.dlk") → use dd.read("file.dlk", key=KEY)
+- salt == key → must be different
+- dd.when(...).when(...) without .otherwise(default)
+- hardcode salt/key
+
+## dd.col IS polars.col
+dd.col("x").over("group")  dd.col("x").rank("dense")  dd.col("x").str.to_lowercase()
+
+## New in v1.0.1
+canary:    dd.store(df, "f.dlk", key=KEY, canary=True)  # transparent inject/strip
+semantic:  dd.mask_text(text, salt=SALT, strategy="semantic")  # valid fake CPF/email
+scandir:   dd.scan_directory("./data/", min_risk="medium").to_html("report.html")
+webhook:   dd.configure(audit_webhook="https://hooks.slack.com/...")

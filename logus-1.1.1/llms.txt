@@ -1,0 +1,309 @@
+# logus-lgpd
+
+> Privacy-by-Design for tabular data in Python. LGPD compliance, PII masking,
+> AES-256-GCM encryption, and expressive data manipulation over Polars.
+
+## Installation
+
+```bash
+pip install logus-lgpd                   # core (Polars + pandas + cryptography)
+pip install "logus-lgpd[sql]"            # + DuckDB for lg.sql()
+pip install "logus-lgpd[excel]"          # + openpyxl for .xlsx
+pip install "logus-lgpd[synthetic]"      # + CTGAN for lg.clone()
+pip install "logus-lgpd[full]"           # everything
+```
+
+## Always import as
+
+```python
+import logus as lg   # canonical alias — always use this
+import os
+
+SALT = os.environ["LOGUS_SALT"]   # HMAC key for PII masking
+KEY  = os.environ["LOGUS_KEY"]    # AES-256 key for .lgs encryption
+# SALT and KEY must be different values
+```
+
+## Core capabilities
+
+1. **Unified I/O** — `lg.read()` reads any tabular format; returns `pl.DataFrame`
+2. **Expressive manipulation** — SQL-like DSL: `lg.where()`, `lg.groupby()`, `lg.add_column()`
+3. **Automatic PII detection** — `lg.scan()` finds CPF, email, phone, CEP, name, date
+4. **Deterministic masking** — `lg.mask()` with HMAC-SHA256; same value → same token across tables
+5. **Encrypted storage** — `.lgs` format: AES-256-GCM + Parquet/zstd internally
+6. **Big data** — `header_only`, `head`, `sample`, `n_chunks/chunks`, `iter_chunks` params
+7. **Database connection** — `lg.db()` object integrates with `lg.read(banco, table)`
+
+## Minimal end-to-end example
+
+```python
+import logus as lg
+import os
+
+SALT = os.environ["LOGUS_SALT"]
+KEY  = os.environ["LOGUS_KEY"]
+
+# Read any format
+df = lg.read("clientes.csv")               # auto-detects encoding, returns pl.DataFrame
+
+# Manipulate
+df = lg.where(df, uf="SP", tipo_pessoa="PF")
+df = lg.add_column(df,
+    imposto = lg.col("renda_mensal") * 0.275,
+    faixa   = lg.when(lg.col("renda_mensal") > 10_000, "alta")
+                .when(lg.col("renda_mensal") > 5_000,  "media")
+                .otherwise("baixa"),
+)
+
+# Detect and mask PII (LGPD compliance)
+reports  = lg.scan(df)                     # {'cpf': ColumnReport, 'email': ...}
+df_safe  = lg.mask(df, salt=SALT)          # HMAC-SHA256, deterministic
+
+# Save encrypted
+lg.store(df_safe, "clientes.lgs", key=KEY)
+
+# Read back
+df_back = lg.read("clientes.lgs", key=KEY)
+```
+
+## Complete pipeline in one call
+
+```python
+result = lg.process(
+    "clientes.csv",
+    salt=SALT,
+    key=KEY,
+    output="clientes_safe.lgs",
+    where={"uf": ["SP", "RJ"]},
+    rules={"cpf": {"not_null": True}, "renda_mensal": {"min": 0}},
+)
+# result.df            → pl.DataFrame (masked)
+# result.reports       → Dict[str, ColumnReport]
+# result.privacy_score → int 0–100
+# result.validation    → ValidationReport
+# result.lineage       → LineageTracker
+result.print_summary()
+```
+
+## Key functions
+
+### I/O
+
+| Function | Returns | Notes |
+|---|---|---|
+| `lg.read(path)` | `pl.DataFrame` | Any format, auto-encoding |
+| `lg.read(path, head=N)` | `pl.DataFrame` | First N rows, no full scan |
+| `lg.read(path, sample=N)` | `pl.DataFrame` | Random row groups (Parquet) |
+| `lg.read(path, n_chunks=5, chunks=[2,4])` | `pl.DataFrame` | Partial read by chunk |
+| `lg.read(path, iter_chunks=True)` | `Generator[pl.DataFrame]` | Streaming, no OOM |
+| `lg.read(path, header_only=True)` | `dict` | Schema+shape, zero data read |
+| `lg.read(banco, "table")` | `pl.DataFrame` | From DatabaseConnection |
+| `lg.store(df, "out.lgs", key=KEY)` | `dict` | AES-256-GCM encrypted |
+| `lg.write(df, "out.parquet")` | `None` | Any format by extension |
+| `lg.stream("big.csv", salt=SALT)` | `Generator[pl.DataFrame]` | True streaming |
+
+### Privacy / LGPD
+
+| Function | Returns | Notes |
+|---|---|---|
+| `lg.scan(df)` | `Dict[str, ColumnReport]` | Detects PII columns |
+| `lg.mask(df, salt=SALT)` | same type as input | HMAC-SHA256, deterministic |
+| `lg.mask(lf, salt=SALT)` | `pl.LazyFrame` | Lazy — stays lazy until .collect() |
+| `lg.diff(orig, masked)` | `dict` | Shows what changed |
+| `lg.profile(df)` | `dict` | Full LGPD diagnostic + privacy_score |
+| `lg.join(df1, df2, on="cpf", salt=SALT)` | `pd.DataFrame` | Safe JOIN with token integrity |
+| `lg.validate(df, rules)` | `ValidationReport` | Data quality rules |
+| `lg.process(...)` | `ProcessResult` | Full pipeline in one call |
+
+### Manipulation (all preserve input type: pl→pl, pd→pd)
+
+```python
+lg.where(df, uf="SP")                          # equality
+lg.where(df, uf=["SP","RJ"])                   # isin
+lg.where(df, renda=(">", 5_000))               # operator
+lg.where(df, renda=(5_000, 15_000))            # between
+lg.where(df, nome=("contains", "Silva"))       # string
+lg.where(df, lg.col("renda") > 5_000)          # pl.Expr (all Polars methods available)
+
+lg.sort(df, "renda_mensal", desc=True)
+lg.groupby(df, "uf", {"n": ("*","count"), "media": ("renda","mean")})
+lg.add_column(df, taxa=lg.col("renda") * 0.27)
+lg.select(df, ["cpf","renda","uf"])
+lg.unique(df, "cpf")
+lg.pivot(df, index="uf", columns="tipo", values="renda", aggfunc="mean")
+lg.top_n(df, 3, "renda", group_by="uf")
+```
+
+### Database
+
+```python
+banco = lg.db("postgresql://user:pass@host/db", salt=SALT)
+df    = lg.read(banco, "clientes")
+df    = lg.read(banco, "clientes", sample=10_000)
+df    = lg.read(banco, "SELECT * FROM clientes WHERE uf='SP'")
+banco.write(df_safe, "clientes_masked")
+banco.tables()           # list tables
+banco.schema("clientes") # {'cpf': 'TEXT', 'renda': 'FLOAT', ...}
+
+with lg.db("postgresql://...", salt=SALT) as banco:
+    df = banco.read("clientes")
+```
+
+### SQL via DuckDB
+
+```python
+# pip install "logus-lgpd[sql]"
+result = lg.sql(
+    "SELECT uf, AVG(renda) AS media FROM df GROUP BY uf ORDER BY media DESC",
+    df=df,
+)
+# JOIN two DataFrames
+result = lg.sql("SELECT c.uf, p.valor FROM c JOIN p ON c.cpf = p.cpf",
+                c=df_clientes, p=df_pedidos)
+```
+
+### Privacy metrics
+
+```python
+lg.check.kanon(df, quasi_identifiers=["uf","idade"])   # k-anonymity
+lg.check.risk(df, quasi_identifiers=["uf","idade"])    # re-identification risk 0–1
+lg.check.utility(df_original, df_masked)               # PSI, KS, utility score
+lg.check.dp(epsilon=1.0).laplace(mean_value, sensitivity=max_val)  # differential privacy
+```
+
+## Type preservation rules
+
+- `lg.mask(pd.DataFrame)` → `pd.DataFrame`
+- `lg.mask(pl.DataFrame)` → `pl.DataFrame`
+- `lg.mask(pl.LazyFrame)` → `pl.LazyFrame`
+- `lg.where(pd.DataFrame)` → `pd.DataFrame`
+- `lg.where(pl.DataFrame)` → `pl.DataFrame`
+- ALL manipulation functions preserve the input type
+
+## The .lgs format
+
+`.lgs` is an encrypted columnar container: AES-256-GCM + HKDF-SHA256 + Parquet/zstd.
+
+```python
+# Write
+lg.store(df, "data.lgs", key=KEY)                      # raw, encrypted
+lg.store(df, "data.lgs", key=KEY, salt=SALT)           # masked + encrypted
+lg.store({"clients": df1, "orders": df2}, "multi.lgs", key=KEY)  # multi-frame
+
+# Read
+df   = lg.read("data.lgs", key=KEY)
+info = lg.inspect("data.lgs", key=KEY)                 # metadata WITHOUT decrypting
+#  → {"version":"2.1","columns":[...],"column_stats":{...},"shape":[150000,12]}
+
+# OO interface
+with lg.open("data.lgs", key=KEY) as f:
+    df     = f.read()
+    frames = f.frames()         # multi-frame
+    f.write(df_updated)
+    f.add_frame("new", df_new)
+```
+
+## Common errors and fixes
+
+```python
+# ValueError: key= e salt= não devem ser iguais
+SALT = lg.generate_salt()   # for masking
+KEY  = lg.generate_salt()   # for encryption — different value!
+
+# IdempotencyError: Coluna 'cpf' parece já mascarada
+df_safe = lg.mask(df_already_masked, salt=SALT, strict=False)
+
+# UserWarning: salt aleatório gerado
+lg.configure(default_salt=os.environ["LOGUS_SALT"])   # once at startup
+
+# ImportError: No module named 'duckdb'
+# pip install "logus-lgpd[sql]"
+
+# ImportError: No module named 'openpyxl'
+# pip install "logus-lgpd[excel]"
+
+# FileNotFoundError on lg.read()
+# Check path exists; use pathlib.Path for cross-platform paths
+```
+
+## Code generation rules for AI agents
+
+1. ALWAYS `import logus as lg` — never `from logus import *`
+2. NEVER hardcode SALT or KEY in code — always `os.environ["LOGUS_SALT"]`
+3. SALT and KEY must be DIFFERENT values
+4. NEVER read `.lgs` with `open()` — always `lg.read(path, key=KEY)`
+5. `lg.when(...).when(...).otherwise(default)` — always end with `.otherwise()`
+6. `lg.mask()` without `salt=` in production generates random salt — JOINs will break
+7. Use `pathlib.Path` for file paths
+8. `lg.col` IS `polars.col` — all 200+ Polars methods available (`.over()`, `.rank()`, etc.)
+
+## Source: https://github.com/leomborges/logus-lgpd
+## Docs:   https://logus-lgpd.readthedocs.io (or see logus-docs.md)
+## PyPI:   https://pypi.org/project/logus-lgpd/
+
+## New in v1.1.1
+
+### lg.contract() — Data Contract
+```python
+contrato = lg.contract({
+    "cpf":   {"type":"str","not_null":True,"pii":"CPF","mask":"hash"},
+    "renda": {"type":"float","min":0,"max":500_000,"pii":"numerico","mask":"mock_numeric"},
+    "uf":    {"type":"str","in":["SP","RJ","MG"]},
+})
+result = contrato.apply(df, salt=SALT)   # validate + mask in one call
+result.raise_if_failed()
+contrato.save("schema.contract.json")
+diff = contrato.diff(contrato_v2)        # detect breaking changes
+schema = contrato.to_json_schema()       # JSON Schema draft-07
+```
+
+### Custom PII patterns
+```python
+reports = lg.scan(df, custom_patterns={"num_contrato": r"^CTR-[0-9]{8}$"})
+```
+
+### Asymmetric encryption
+```python
+priv, pub = lg.generate_keypair("ec")
+lg.store(df, "dados.lgs", public_key=pub)    # encrypt with recipient's public key
+df    = lg.read("dados.lgs", private_key=priv)
+```
+
+### File expiration (LGPD Art. 16)
+```python
+lg.store(df, "dados.lgs", key=KEY, expires_at="2025-12-31")
+# → ExpiredFileError after that date
+```
+
+### Schema validation + rule persistence
+```python
+lg.validate_schema(df, required_columns=["cpf","renda"], min_rows=1)
+lg.save_rules({"cpf":{"not_null":True}}, "rules.json")
+rules = lg.load_rules("rules.json")
+```
+
+### LGPD compliance report
+```python
+report = lg.compliance_report(df, reports, dataset_name="Clientes Q1")
+report.to_html("lgpd.html")
+report.to_pdf("lgpd.pdf")    # pip install weasyprint
+```
+
+### Time-series and nested data
+```python
+lg.shift(df, 1)                # lag (previous value)
+lg.lead(df, 1)                 # lead (next value)
+lg.lag(df, 3, columns="renda") # lag alias
+lg.explode(df, "tags")         # expand list column to rows
+```
+
+### .env auto-detection
+```python
+lg.configure(load_dotenv=True)     # loads LOGUS_SALT and LOGUS_KEY from .env
+```
+
+### Database — create_table + upsert
+```python
+banco.create_table(df, "clientes", if_exists="replace")
+banco.upsert(df_new, "clientes", on="cpf")
+```

@@ -1,0 +1,63 @@
+# logus-lgpd — Cursor IDE Rules
+
+## Import
+```python
+import logus as lg   # always this alias
+import os
+SALT = os.environ["LOGUS_SALT"]
+KEY  = os.environ["LOGUS_KEY"]
+```
+
+## Quick patterns
+
+Read any file:          `df = lg.read("file.csv")`
+Filter rows:            `df = lg.where(df, uf="SP")`
+Add column:             `df = lg.add_column(df, taxa=lg.col("renda")*0.27)`
+Detect PII:             `reports = lg.scan(df)`
+Mask PII:               `df_safe = lg.mask(df, salt=SALT)`
+Save encrypted:         `lg.store(df_safe, "out.lgs", key=KEY)`
+Read encrypted:         `df = lg.read("out.lgs", key=KEY)`
+Full pipeline:          `result = lg.process("in.csv", salt=SALT, key=KEY, output="out.lgs")`
+Big file (no OOM):      `df = lg.read("big.parquet", head=100_000)`
+DB connection:          `banco = lg.db("postgresql://...", salt=SALT); df = lg.read(banco, "table")`
+
+## Type rules
+- lg.mask(pd.DataFrame) → pd.DataFrame
+- lg.mask(pl.DataFrame) → pl.DataFrame
+- lg.mask(pl.LazyFrame) → pl.LazyFrame  (stays lazy)
+- lg.where / lg.sort / lg.groupby / lg.add_column ALL preserve input type
+
+## Never do
+- `open("file.lgs")` → use `lg.read("file.lgs", key=KEY)`
+- `salt == key` → must be different values
+- `lg.when(...).when(...)` without `.otherwise(default)`
+- hardcode salt/key strings in code
+
+## lg.col IS polars.col
+lg.col("x").over("group")        # window function
+lg.col("x").rank("dense")        # rank
+lg.col("x").str.to_lowercase()   # string ops
+lg.col("x").dt.year()            # datetime ops
+lg.col("x").rolling_mean(3)      # rolling
+
+## Architecture
+core.py → read_file(), mask_frame(), mask_lazyframe()
+analytics.py → where, sort, groupby, add_column, when, pivot, melt, concat...
+io_big.py → read_partial(), DatabaseConnection, build_csv_index()
+processor.py → process(), ProcessResult
+secure_file.py → .lgs format (AES-256-GCM)
+detectors/fast_scan.py → FastPIIScanner (default, 9× faster)
+
+## v1.1.1 additions
+contract:      `contrato = lg.contract({"cpf":{"pii":"CPF","mask":"hash","not_null":True}})`
+apply:         `result = contrato.apply(df, salt=SALT); result.raise_if_failed()`
+asymmetric:    `priv,pub = lg.generate_keypair("ec"); lg.store(df,"f.lgs",public_key=pub)`
+expiration:    `lg.store(df,"f.lgs",key=KEY,expires_at="2025-12-31")`
+val_schema:    `lg.validate_schema(df,required_columns=["cpf","renda"],min_rows=1)`
+save_rules:    `lg.save_rules(rules,"r.json"); rules=lg.load_rules("r.json")`
+compliance:    `lg.compliance_report(df,reports,dataset_name="DS").to_html("r.html")`
+shift/lag:     `lg.shift(df,1)  lg.lag(df,3,columns="x")  lg.lead(df,1)`
+explode:       `lg.explode(df,"tags")  # list column → multiple rows`
+dotenv:        `lg.configure(load_dotenv=True)  # reads LOGUS_SALT from .env`
+create_table:  `banco.create_table(df,"t",if_exists="replace")`
+upsert:        `banco.upsert(df_new,"clientes",on="cpf")`

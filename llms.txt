@@ -1,0 +1,172 @@
+# datalock
+
+> Privacy-by-Design for tabular data in Python.
+> LGPD/GDPR compliance, PII masking, AES-256-GCM encryption (.dlk),
+> expressive DSL over Polars, canary data, semantic text masking.
+
+Renamed from logus-lgpd. `import logus as lg` still works.
+
+## Installation
+
+```bash
+pip install datalock
+pip install "datalock[sql]"         # DuckDB
+pip install "datalock[synthetic]"   # Faker for richer synthetic data
+pip install "datalock[full]"
+```
+
+## Always import as
+
+```python
+import datalock as dd
+import os
+
+SALT = os.environ["DATALOCK_SALT"]
+KEY  = os.environ["DATALOCK_KEY"]
+# SALT and KEY must be different values
+```
+
+## Core patterns
+
+```python
+df       = dd.read("file.csv")                    # any format → pl.DataFrame
+df       = dd.read("file.dlk", key=KEY)           # decrypt .dlk
+df       = dd.read("big.parquet", head=100_000)   # partial read, no OOM
+reports  = dd.scan(df)                            # detect PII columns
+df_safe  = dd.mask(df, salt=SALT)                 # mask PII, preserves type
+dd.store(df_safe, "out.dlk", key=KEY)             # encrypt and save
+result   = dd.process("in.csv", salt=SALT, key=KEY, output="out.dlk")
+```
+
+## New in v1.0.1 (datalock)
+
+### Canary data — transparent leak tracing
+```python
+# Canary rows injected silently, stripped on read. User never sees them.
+dd.store(df, "f.dlk", key=KEY, canary=True)
+df_back = dd.read("f.dlk", key=KEY)         # df_back.shape == df.shape
+
+# When breach token found in dump:
+dd.canary_check("canary.1ba472d8@datalock.internal")
+# → {"pipeline_id": "crm_jan2025", "filepath": "f.dlk", "injected_at": ...}
+```
+
+### Semantic text masking
+```python
+text = "CPF 111.444.777-35, email joao@empresa.com"
+
+dd.mask_text(text, salt=SALT, strategy="redact")   # → "[CPF], [EMAIL]"
+dd.mask_text(text, salt=SALT, strategy="hash")     # → "3f2a8b1c, 9e1d3c7f"
+dd.mask_text(text, salt=SALT, strategy="semantic") # → "478.622.984-97, roberto.santos@gmail.com"
+# semantic: valid fake CPF (checksum correct), no faker required
+# deterministic: same input + same salt → same fake value (preserves joins)
+```
+
+### Directory PII inventory
+```python
+inventory = dd.scan_directory("./dados/", recursive=True, min_risk="medium")
+print(inventory.summary())
+inventory.to_html("inventory.html")
+for path, fi in inventory.items():
+    print(f"{path}: {fi.max_risk} — {list(fi.pii_columns.keys())}")
+```
+
+### Audit webhook
+```python
+dd.configure(audit_webhook="https://hooks.slack.com/T.../B.../xxx")
+# Every dd.mask(), dd.store(), dd.scan() fires a POST (non-blocking, best-effort)
+```
+
+## Key functions
+
+### I/O
+| Function | Notes |
+|---|---|
+| `dd.read(path)` | Any format → pl.DataFrame |
+| `dd.read(path, head=N)` | First N rows |
+| `dd.read(path, sample=N)` | Parquet: random row groups; CSV: head(N) with warning |
+| `dd.read(path, n_chunks=5, chunks=[2,4])` | Partial read by chunk |
+| `dd.read(path, iter_chunks=True)` | Generator, no OOM |
+| `dd.read(path, header_only=True)` | Schema + shape, zero data read |
+| `dd.read(banco, "table")` | From DatabaseConnection |
+| `dd.store(df, "out.dlk", key=KEY)` | AES-256-GCM encrypted |
+| `dd.store(df, ..., canary=True)` | With transparent canary rows |
+| `dd.store(df, ..., expires_at="2025-12-31")` | Expiry enforced on read |
+| `dd.store(df, ..., public_key=pub)` | Asymmetric encryption |
+| `dd.read(f, private_key=priv)` | Decrypt asymmetric |
+
+### Privacy / LGPD
+| Function | Notes |
+|---|---|
+| `dd.scan(df)` | → Dict[str, ColumnReport] |
+| `dd.scan(df, custom_patterns={...})` | + company-specific identifiers |
+| `dd.mask(df, salt=SALT)` | HMAC-SHA256, deterministic |
+| `dd.mask(lf, salt=SALT)` | LazyFrame stays lazy |
+| `dd.mask_text(text, strategy=)` | "redact"/"hash"/"partial"/"semantic" |
+| `dd.scan_directory(path)` | Directory PII inventory |
+| `dd.compliance_report(df, reports)` | HTML/PDF LGPD report |
+| `dd.validate_schema(df, ...)` | Schema-level validation |
+| `dd.canary_check(token)` | Look up breach token in manifest |
+
+### Manipulation (pd→pd, pl→pl, lazy→lazy)
+```python
+dd.where(df, uf="SP")
+dd.where(df, uf=["SP","RJ"])
+dd.where(df, renda=(5_000, 15_000))
+dd.sort(df, "renda", desc=True)
+dd.groupby(df, "uf", {"n":("*","count"), "media":("renda","mean")})
+dd.add_column(df, taxa=dd.col("renda")*0.27)
+dd.when(dd.col("renda")>10_000,"alta").otherwise("baixa")
+dd.shift(df, 1)          # lag
+dd.lead(df, 1)           # lead
+dd.explode(df, "tags")   # list column → rows
+dd.pivot(df, index="uf", columns="tipo", values="renda")
+```
+
+### Database
+```python
+banco = dd.db("postgresql://user:pass@host/db", salt=SALT)
+df    = dd.read(banco, "clientes")
+df    = dd.read(banco, "SELECT * FROM c WHERE uf='SP'")
+df    = dd.read(banco, "clientes", sample=10_000)
+banco.create_table(df, "clientes", if_exists="replace")
+banco.upsert(df_new, "clientes", on="cpf")
+banco.write(df_safe, "clientes_masked")
+banco.tables(); banco.schema("clientes")
+with dd.db("sqlite:///db.sqlite") as banco: ...
+```
+
+### Synthetic data
+```python
+gen = dd.SyntheticGenerator(seed=42)
+gen.cpf()   # "478.622.984-97" — valid checksum, no faker needed
+gen.cnpj()  # "91.202.089/8546-89"
+gen.email() # "roberto.santos@gmail.com"
+gen.nome()  # "Maria Aparecida"
+gen.generate("cpf")  # same as gen.cpf()
+# If faker installed (pip install datalock[synthetic]): uses Faker pt_BR automatically
+```
+
+## Critical rules for AI code generation
+
+1. ALWAYS `import datalock as dd` — never `from datalock import *`
+2. NEVER hardcode SALT or KEY — always `os.environ["DATALOCK_SALT"]`
+3. SALT and KEY must be DIFFERENT values
+4. NEVER `open("file.dlk")` — always `dd.read("file.dlk", key=KEY)`
+5. `dd.when(...).when(...).otherwise(default)` — always end with `.otherwise()`
+6. `dd.mask()` without `salt=` generates random salt — JOINs will break
+7. `dd.col` IS `polars.col` — all 200+ Polars methods work
+8. All manipulation functions preserve input type (pd→pd, pl→pl, lazy→lazy)
+
+## .dlk format
+
+AES-256-GCM + HKDF-SHA256 + Parquet/zstd. Magic: `b"DLOCK"` (v1.0.1+).
+Backward compat: `b"LOGUS"` (.lgs files from logus-lgpd) still readable.
+
+## Backward compat
+
+```python
+import logus as lg   # still works — alias to datalock
+lg.mask(df, salt=SALT)  # identical to dd.mask()
+dd.read("old_file.lgs", key=KEY)  # .lgs files readable
+```
