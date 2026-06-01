@@ -38,7 +38,7 @@ dd.store(df_safe, "out.dlk", key=KEY)             # encrypt and save
 result   = dd.process("in.csv", salt=SALT, key=KEY, output="out.dlk")
 ```
 
-## New in v1.0.1 (datalock)
+## New in v1.1.1 (datalock)
 
 ### Canary data — transparent leak tracing
 ```python
