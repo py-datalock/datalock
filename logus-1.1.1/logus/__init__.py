@@ -19,7 +19,7 @@ Uso rápido:
 """
 from __future__ import annotations
 
-__version__ = "1.1.1"
+__version__ = "1.1.0"
 
 # ---------------------------------------------------------------------------
 # Imports internos — ordem importa para evitar circular
@@ -159,7 +159,7 @@ __all__ = [
     "to_pandas", "to_polars",
     # Pipeline e SQL
     "pipe", "sql",
-    # v1.1.1 — 10 new features
+    # v1.1.0 — 10 new features
     'contract', 'DataContract', 'FieldSpec', 'ContractDiff',
     'validate_schema', 'save_rules', 'load_rules',
     'compliance_report',

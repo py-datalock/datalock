@@ -427,13 +427,15 @@ def mask_lazyframe(
     Mascara um pl.LazyFrame sem materializar o DataFrame inteiro.
 
     Estratégia:
-      1. Materializa apenas lf.fetch(500) para detecção PII (amostra mínima).
+      1. Materializa apenas lf.head(500).collect() para detecção PII (amostra mínima).
+         (lf.fetch() foi removido no Polars ≥1.0; lf.head(n).collect() é o equivalente.)
       2. Constrói expressões de mascaramento como pl.Expr (hash, redact, etc.).
       3. Aplica via lf.with_columns([...]) — permanece lazy até .collect().
 
     Limitações vs mask(pl.DataFrame):
       - Idempotency check desabilitado (exigiria coletar para verificar tokens).
-      - mock_cat e mock_numeric usam values do sample — distribuição aproximada.
+      - mock_cat e mock_numeric usam map_batches por batch — distribuição aproximada
+        baseada nos valores do batch corrente, não do DataFrame completo.
 
     Args:
         lf:           LazyFrame a mascarar.
@@ -477,29 +479,39 @@ def mask_lazyframe(
         if expr is not None:
             lazy_exprs.append(expr)
         else:
-            # Fallback: eager expr computed from sample (mock_cat/num)
-            eager_expr = masker._build_expr(sample_df, col_name, report)
-            if eager_expr is not None:
-                # Convert eager pl.Expr/pl.Series result to a literal series
-                # This is approximate but correct for mock strategies
-                eager_result = sample_df.select(eager_expr)
-                # For mock strategies, use a literal drawn from sample distribution
-                from datalock.detectors.pii_detector import MaskStrategy
-                if report.mask_strategy in (MaskStrategy.MOCK_CAT, MaskStrategy.MOCK_NUM):
-                    # Pre-compute on the sample and let lazy apply via map_batches
-                    _report_copy = report
-                    _masker_ref  = masker
-                    def _batch_fn(df_batch: pl.DataFrame, _r=_report_copy, _m=_masker_ref) -> pl.DataFrame:
-                        expr = _m._build_expr(df_batch, col_name, _r)
-                        if expr is not None:
-                            return df_batch.select(expr).rename({df_batch.columns[0]: col_name})
-                        return df_batch.select(col_name)
-                    # map_batches on a single column
-                    lazy_exprs.append(
-                        lf.select(col_name).map_batches(
-                            lambda b, _fn=_batch_fn: _fn(b)
-                        ).collect()[col_name].alias(col_name)
-                    )
+            # Fallback para MOCK_CAT / MOCK_NUM: _build_lazy_expr retorna None porque
+            # o LazyFrame não tem comprimento conhecido. Usamos map_batches genuinamente
+            # lazy — cada batch é processado pelo engine eager sem coletar o frame inteiro.
+            from datalock.detectors.pii_detector import MaskStrategy
+            if report.mask_strategy in (MaskStrategy.MOCK_CAT, MaskStrategy.MOCK_NUM):
+                # Captura variáveis no escopo do loop com argumentos default para
+                # evitar o problema clássico de closure em Python.
+                _report_copy = report
+                _masker_ref  = masker
+                _col         = col_name
+
+                def _batch_fn(
+                    df_batch: pl.DataFrame,
+                    _r=_report_copy,
+                    _m=_masker_ref,
+                    _c=_col,
+                ) -> pl.DataFrame:
+                    expr = _m._build_expr(df_batch, _c, _r)
+                    if expr is None:
+                        return df_batch.select(_c)
+                    result = df_batch.select(expr)
+                    # Garante que a coluna de saída tem o nome original
+                    if result.columns[0] != _c:
+                        result = result.rename({result.columns[0]: _c})
+                    return result
+
+                # map_batches recebe um LazyFrame de uma única coluna e retorna
+                # um LazyFrame de uma única coluna — permanece lazy até .collect().
+                lazy_exprs.append(
+                    lf.select(col_name)
+                    .map_batches(_batch_fn)
+                    .select(pl.first().alias(col_name))
+                )
 
     if lazy_exprs:
         return lf.with_columns(lazy_exprs)

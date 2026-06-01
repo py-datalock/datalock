@@ -361,7 +361,7 @@ result  = lf_safe.collect()
 
 ---
 
-## v1.1.1 new features
+## v1.1.0 new features
 
 ### lg.contract() — Data Contract (unified validation + PII + masking)
 ```python

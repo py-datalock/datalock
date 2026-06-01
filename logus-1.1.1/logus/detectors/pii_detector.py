@@ -551,7 +551,7 @@ class PIIDetector:
     ) -> Tuple[float, List[str], Optional[PIIType]]:
         """
         Detecção vetorizada via str.fullmatch() — fallback sem Polars.
-        Mantido idêntico ao código anterior (v1.1.1).
+        Mantido idêntico ao código anterior (v1.1.0).
         """
         null_ratio = series.isna().mean()
         effective_threshold = self.match_threshold * max(0.4, 1 - null_ratio * 0.5)

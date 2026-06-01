@@ -241,7 +241,7 @@ lg.configure(default_salt=os.environ["LOGUS_SALT"])   # once at startup
 ## Docs:   https://logus-lgpd.readthedocs.io (or see logus-docs.md)
 ## PyPI:   https://pypi.org/project/logus-lgpd/
 
-## New in v1.1.1
+## New in v1.1.0
 
 ### lg.contract() — Data Contract
 ```python

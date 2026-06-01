@@ -11,7 +11,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "logus-lgpd"
-version = "1.1.1"
+version = "1.1.0"
 description = "Privacy-by-Design para dados tabulares — LGPD compliance em Python."
 readme = "README.md"
 license = { text = "GNU AGPLv3" }

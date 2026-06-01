@@ -1,6 +1,6 @@
 # Changelog — logus-lgpd
 
-## v1.1.1 (2026-05)
+## v1.1.0 (2026-05)
 
 ### 10 novas features
 

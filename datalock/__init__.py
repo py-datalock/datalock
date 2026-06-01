@@ -172,7 +172,7 @@ __all__ = [
     "pipe", "sql",
     # v1.0.1 (datalock) — canary, scan_directory, synthetic, audit webhook
     'view', 'canary_check', 'canary_info', 'scan_directory', 'DirectoryInventory', 'SyntheticGenerator',
-    # v1.1.1 — 10 new features
+    # v1.1.0 — 10 new features
     'contract', 'DataContract', 'FieldSpec', 'ContractDiff',
     'validate_schema', 'save_rules', 'load_rules',
     'compliance_report',
@@ -1286,6 +1286,8 @@ def configure(
     audit: Optional[Any] = None,
     audit_path: Optional[str] = None,
     default_salt: Optional[str] = None,
+    canary_salt: Optional[str] = None,
+    wm_salt: Optional[str] = None,
     load_dotenv: bool = False,
     dotenv_path: Optional[str] = None,
     audit_webhook: Optional[str] = None,
@@ -1296,35 +1298,53 @@ def configure(
     Args:
         audit:        AuditReport para trilha de auditoria automática.
         audit_path:   Diretório para auto-criar AuditReport com gravação em arquivo.
-        default_salt: Salt padrão. Nunca commite o valor real no código.
+        default_salt: Salt padrão para mascaramento. Nunca commite o valor real no código.
+        canary_salt:  Salt secreto para geração de fingerprints canary (tabular).
+                      Substitui o valor padrão público hardcoded no source.
+                      Em produção, use os.environ["DATALOCK_CANARY_SALT"] ou .env.
+                      Com um salt secreto, adversários não conseguem pré-calcular
+                      os fingerprints para remover canary rows antes de um breach.
+        wm_salt:      Salt secreto para fingerprints de watermarking textual.
+                      Substitui o valor padrão público. Use DATALOCK_WM_SALT no .env.
         load_dotenv:  Se True, carrega variáveis de um arquivo .env (requer python-dotenv).
+                      Lê DATALOCK_SALT, DATALOCK_CANARY_SALT e DATALOCK_WM_SALT automaticamente.
         audit_webhook: URL para receber eventos de auditoria via HTTP POST (JSON).
                        Cada operação dd.mask(), dd.scan(), dd.store() dispara um POST.
                        Suporta Slack webhooks, SIEM, Datadog, ou qualquer endpoint HTTP.
-                      Após carregar, dd.configure lê DATALOCK_SALT e DATALOCK_KEY automaticamente.
         dotenv_path:  Caminho para o .env. None = procura ".env" no diretório atual.
 
     Exemplos:
-        # Carrega .env automaticamente
+        # Carrega .env automaticamente (recomendado — salts nunca no código)
         dd.configure(load_dotenv=True)
-        # Após isso: DATALOCK_SALT e DATALOCK_KEY disponíveis via os.environ
+
+        # Configuração explícita (valores de variáveis de ambiente, não literals)
+        dd.configure(
+            default_salt=os.environ["DATALOCK_SALT"],
+            canary_salt=os.environ["DATALOCK_CANARY_SALT"],
+        )
 
         from datalock.reports.audit_report import AuditReport
         dd.configure(audit=AuditReport())
         dd.configure(audit_path="./audit/")
-        dd.configure(default_salt=os.environ["DATALOCK_SALT"])
     """
     # Auto-load .env if requested
     if load_dotenv:
         try:
             from dotenv import load_dotenv as _load_dotenv
             _load_dotenv(dotenv_path=dotenv_path, override=False)
-            # Read DATALOCK_SALT and DATALOCK_KEY from env if not already set
             import os as _os
             if default_salt is None:
                 _env_salt = _os.environ.get("DATALOCK_SALT")
                 if _env_salt:
                     default_salt = _env_salt
+            if canary_salt is None:
+                _env_canary = _os.environ.get("DATALOCK_CANARY_SALT")
+                if _env_canary:
+                    canary_salt = _env_canary
+            if wm_salt is None:
+                _env_wm = _os.environ.get("DATALOCK_WM_SALT")
+                if _env_wm:
+                    wm_salt = _env_wm
         except ImportError:
             warnings.warn(
                 "dd.configure(load_dotenv=True) requer python-dotenv. "
@@ -1350,6 +1370,18 @@ def configure(
         _d.DEFAULT_SALT = default_salt
         from datalock.adapters import pandas_adapter as _pa2
         _pa2._DEFAULT_SALT = default_salt
+
+    if canary_salt is not None:
+        import datalock._defaults as _d2
+        _d2.CANARY_SALT = canary_salt
+        import datalock.canary as _canary
+        _canary._CANARY_SALT_OVERRIDE = canary_salt
+
+    if wm_salt is not None:
+        import datalock._defaults as _d3
+        _d3.WM_SALT = wm_salt
+        import datalock.canary as _canary2
+        _canary2._WM_SALT_OVERRIDE = wm_salt
 
 
 # ---------------------------------------------------------------------------

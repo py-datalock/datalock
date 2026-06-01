@@ -239,21 +239,75 @@ class AuditReport:
             "entries": entries_enriched,
         }
 
-    def save(self, path: str) -> None:
+    def save(self, path: str, audit_key: Optional[str] = None) -> None:
         """
-        Salva relatório de auditoria como JSON.
-        Usa filelock para segurança em ambientes multiprocessing
-        (Celery, Gunicorn, multiprocessing.Pool).
+        Salva relatório de auditoria como JSON com assinatura HMAC de integridade.
+
+        O campo ``_integrity`` é um HMAC-SHA256 calculado sobre o conteúdo
+        JSON serializado do relatório, usando ``audit_key`` como chave.
+        Isso garante que o relatório de compliance — que serve como evidência
+        técnica de conformidade com a LGPD — não possa ser adulterado sem
+        detecção, mesmo por usuários com acesso ao sistema de arquivos.
+
+        Se ``audit_key`` não for fornecida, o campo ``_integrity`` receberá
+        o valor ``"unsigned"`` e um aviso será emitido. Um relatório não
+        assinado ainda é útil operacionalmente, mas não deve ser usado como
+        evidência formal de compliance.
+
+        Verificação posterior:
+            import hmac, hashlib, json
+            with open("relatorio.json") as f:
+                doc = json.load(f)
+            stored_sig  = doc.pop("_integrity")
+            body_bytes  = json.dumps(doc, ensure_ascii=False,
+                                     separators=(",", ":"), sort_keys=True).encode()
+            expected    = hmac.new(audit_key.encode(), body_bytes, hashlib.sha256).hexdigest()
+            assert hmac.compare_digest(stored_sig, expected), "Relatório adulterado!"
+
+        Args:
+            path:      Caminho de destino do arquivo JSON.
+            audit_key: Chave HMAC para assinatura (recomendado: ≥ 32 chars).
+                       Se None, o relatório é salvo sem assinatura com aviso.
         """
+        import hmac as _hmac_lib
+        import hashlib as _hashlib
+        import warnings as _warnings
+
         p = Path(path)
         p.parent.mkdir(parents=True, exist_ok=True)
         lock_path = str(p) + ".lock"
+
+        report_dict = self.to_dict()
+
+        # Calcula assinatura HMAC sobre o conteúdo canônico do relatório.
+        # Serialização com sort_keys=True e separadores compactos garante
+        # que dois dicts com a mesma estrutura produzam o mesmo HMAC,
+        # independente da ordem de inserção das chaves.
+        if audit_key:
+            body_bytes = json.dumps(
+                report_dict, ensure_ascii=False,
+                separators=(",", ":"), sort_keys=True,
+            ).encode("utf-8")
+            signature = _hmac_lib.new(
+                audit_key.encode("utf-8"), body_bytes, _hashlib.sha256
+            ).hexdigest()
+            report_dict["_integrity"] = signature
+            report_dict["_integrity_algorithm"] = "HMAC-SHA256"
+        else:
+            _warnings.warn(
+                "AuditReport.save() chamado sem audit_key — relatório não assinado. "
+                "Relatórios não assinados podem ser adulterados sem detecção e não "
+                "devem ser usados como evidência formal de compliance com a LGPD. "
+                "Forneça audit_key=os.environ['DATALOCK_AUDIT_KEY'] para assinar.",
+                UserWarning,
+                stacklevel=2,
+            )
+            report_dict["_integrity"] = "unsigned"
 
         try:
             from filelock import FileLock
             lock: Any = FileLock(lock_path, timeout=10)
         except ImportError:
-            # filelock não instalado — fallback para escrita sem lock
             logger.warning(
                 "filelock não instalado. Em ambientes multiprocessing, instale: "
                 "pip install filelock. Continuando sem lock de arquivo."
@@ -263,8 +317,51 @@ class AuditReport:
 
         with lock:
             with open(p, "w", encoding="utf-8") as f:
-                json.dump(self.to_dict(), f, ensure_ascii=False, indent=2)
-        logger.info("Auditoria salva: %s", path)
+                json.dump(report_dict, f, ensure_ascii=False, indent=2)
+        logger.info("Auditoria salva%s: %s", " (assinada)" if audit_key else " (NÃO assinada)", path)
+
+    @staticmethod
+    def verify_signature(path: str, audit_key: str) -> bool:
+        """
+        Verifica a assinatura HMAC de um relatório de auditoria salvo.
+
+        Args:
+            path:      Caminho para o arquivo JSON do relatório.
+            audit_key: Chave usada na assinatura original.
+
+        Returns:
+            True se a assinatura for válida, False se o arquivo foi adulterado.
+
+        Raises:
+            ValueError: Se o relatório não contiver campo _integrity ou
+                        se _integrity == "unsigned".
+        """
+        import hmac as _hmac_lib
+        import hashlib as _hashlib
+
+        with open(path, "r", encoding="utf-8") as f:
+            doc = json.load(f)
+
+        stored_sig = doc.pop("_integrity", None)
+        doc.pop("_integrity_algorithm", None)
+
+        if stored_sig is None:
+            raise ValueError(f"Relatório '{path}' não contém campo _integrity.")
+        if stored_sig == "unsigned":
+            raise ValueError(
+                f"Relatório '{path}' não foi assinado (audit_key ausente no save()). "
+                "Não é possível verificar integridade."
+            )
+
+        body_bytes = json.dumps(
+            doc, ensure_ascii=False,
+            separators=(",", ":"), sort_keys=True,
+        ).encode("utf-8")
+        expected = _hmac_lib.new(
+            audit_key.encode("utf-8"), body_bytes, _hashlib.sha256
+        ).hexdigest()
+
+        return _hmac_lib.compare_digest(stored_sig, expected)
 
     def save_text(self, path: str) -> None:
         p = Path(path)

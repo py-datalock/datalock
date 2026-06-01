@@ -240,76 +240,109 @@ def _require_cryptography() -> Any:
 
 def _df_to_bytes(df, parquet_compression: str = "zstd") -> bytes:
     """
-    Serializa DataFrame para bytes via Parquet em memória.
+    Serializa DataFrame para bytes via Arrow IPC em memória.
 
-    Usa Polars nativamente quando possível — 2-2.5x mais rápido que
-    pa.Table.from_pandas() + pq.write_table() e produz arquivos ~20% menores
-    (Polars aplica estatísticas de coluna melhores antes da compressão).
+    Arrow IPC (Apache Arrow Inter-Process Communication format) é um formato
+    de serialização binária colunar que mapeia diretamente o layout in-memory
+    do Apache Arrow sem overhead de estrutura analítica (row groups, column
+    chunks, footer de predicados). Isso o torna 3-5× mais rápido que Parquet
+    para serialização em memória — contexto exato do .dlk, onde os dados são
+    imediatamente cifrados e o acesso por predicado (pushdown) é irrelevante.
 
-    Aceita pd.DataFrame e pl.DataFrame transparentemente.
+    O argumento parquet_compression é mantido com o mesmo nome por
+    retrocompatibilidade de chamadas existentes — seu valor é mapeado para o
+    equivalente Arrow IPC. O campo 'compression' no cabeçalho do arquivo
+    passa a ser "ipc_zstd", "ipc_lz4" ou "ipc_none" para distinguir de
+    arquivos legados com compressão Parquet interna.
 
-    Formato do payload: b'PQ1\\x00' + bytes_parquet
-    Magic marker garante retrocompatibilidade com _bytes_to_df para arquivos
-    criados com Arrow IPC (datalock < v1.3).
+    Magic markers por formato:
+      b'IPC1\x00' → Arrow IPC (datalock >= v1.4) ← formato atual
+      b'PQ1\x00'  → Parquet  (datalock v1.3)      ← leitura retrocompat
+      (sem marker) → Arrow IPC legado (datalock v1.0-v1.2) ← leitura retrocompat
+
+    Compressões suportadas (mapeadas de parquet_compression):
+      "zstd" → IPC/zstd  — melhor razão tamanho/velocidade (padrão)
+      "lz4"  → IPC/lz4   — máxima velocidade, +2x tamanho vs zstd
+      "none" → IPC sem compressão — máxima velocidade, maior tamanho
 
     Args:
         df:                  pd.DataFrame ou pl.DataFrame.
-        parquet_compression: 'zstd' (padrão, menor tamanho),
-                             'lz4'  (mais rápido, +20% tamanho),
-                             'snappy' (+65% tamanho),
-                             'none'  (sem compressão, máxima velocidade).
+        parquet_compression: "zstd" | "lz4" | "none" (alias mantido por compat).
+
+    Referências:
+        Apache Arrow IPC Format Specification
+        https://arrow.apache.org/docs/format/IPC.html
     """
-    import polars as _pl
+    import pyarrow as pa
+    import pyarrow.ipc as ipc
+
+    # Normaliza o parâmetro de compressão para o vocabulário Arrow IPC.
+    # Arrow IPC suporta "zstd" e "lz4" nativamente via IpcWriteOptions.
+    # "snappy" não é suportado por Arrow IPC — mapeia para "lz4" como
+    # alternativa de performance similar.
+    _COMPRESSION_MAP = {
+        "zstd":   "zstd",
+        "lz4":    "lz4",
+        "snappy": "lz4",   # snappy → lz4 (não suportado por Arrow IPC)
+        "none":   None,
+        "uncompressed": None,
+    }
+    arrow_compression = _COMPRESSION_MAP.get(parquet_compression, "zstd")
+
+    # Converte para Arrow Table — path único independente do tipo de entrada
+    if hasattr(df, "to_arrow"):
+        # pl.DataFrame → Arrow direto, zero-copy quando possível
+        table = df.to_arrow()
+    else:
+        # pd.DataFrame → Arrow via PyArrow (preserva tipos pandas corretamente)
+        table = pa.Table.from_pandas(df, preserve_index=False)
 
     buf = io.BytesIO()
+    opts = ipc.IpcWriteOptions(compression=arrow_compression)
+    with ipc.new_stream(buf, table.schema, options=opts) as writer:
+        writer.write_table(table, max_chunksize=None)
 
-    # Polars nativo — caminho mais rápido e menor footprint
-    if isinstance(df, _pl.DataFrame):
-        comp = parquet_compression if parquet_compression != "none" else "uncompressed"
-        df.write_parquet(buf, compression=comp)
-        return b"PQ1\x00" + buf.getvalue()
-
-    # pd.DataFrame → converte para Polars (evita pa.Table.from_pandas overhead)
-    try:
-        df_pl = _pl.from_pandas(df)
-        comp = parquet_compression if parquet_compression != "none" else "uncompressed"
-        df_pl.write_parquet(buf, compression=comp)
-        return b"PQ1\x00" + buf.getvalue()
-    except Exception:
-        # Fallback pyarrow para DataFrames com tipos não suportados por Polars
-        import pyarrow as pa
-        import pyarrow.parquet as pq
-        table = pa.Table.from_pandas(df, preserve_index=False)
-        compression = parquet_compression if parquet_compression != "none" else None
-        pq.write_table(table, buf, compression=compression, write_statistics=False)
-        return b"PQ1\x00" + buf.getvalue()
+    return b"IPC1\x00" + buf.getvalue()
 
 
 def _bytes_to_df(data: bytes) -> pd.DataFrame:
     """
-    Desserializa bytes para DataFrame.
+    Desserializa bytes para DataFrame com detecção automática de formato.
 
-    Usa Polars nativamente para leitura Parquet — 2x mais rápido que
-    pq.read_table().to_pandas(). Converte para pd.DataFrame no final
-    para manter compatibilidade com o restante do SecureFile (que opera
-    em pandas internamente).
+    Detecta o formato pelo magic marker nos primeiros 5 bytes:
 
-    Detecta automaticamente o formato pelo magic marker:
-      b'PQ1\\x00' → Parquet (datalock v1.3+, lê via Polars)
-      outros      → Arrow IPC (retrocompat com datalock v1.0-v1.2)
+      b'IPC1\\x00' → Arrow IPC (datalock >= v1.4)   ← formato atual
+      b'PQ1\\x00'  → Parquet  (datalock v1.3)        ← retrocompat
+      outros      → Arrow IPC sem marker (datalock v1.0-v1.2) ← retrocompat legado
+
+    Retrocompatibilidade total: arquivos gerados por qualquer versão do
+    datalock são lidos corretamente, sem flag de versão adicional — o magic
+    marker é suficiente para discriminar os três casos.
+
+    Retorna sempre pd.DataFrame para consistência com o restante do SecureFile.
     """
-    if data[:4] == b"PQ1\x00":
+    import pyarrow as pa
+    import pyarrow.ipc as ipc
+
+    marker = data[:5]
+
+    if marker == b"IPC1\x00":
+        # Arrow IPC — formato atual (datalock >= v1.4)
+        reader = ipc.open_stream(io.BytesIO(data[5:]))
+        return reader.read_pandas()
+
+    elif marker[:4] == b"PQ1\x00":
+        # Parquet — datalock v1.3 (retrocompat)
         try:
             import polars as _pl
             return _pl.read_parquet(io.BytesIO(data[4:])).to_pandas()
         except Exception:
-            # Fallback pyarrow se Polars não conseguir ler o arquivo
             import pyarrow.parquet as pq
             return pq.read_table(io.BytesIO(data[4:])).to_pandas()
+
     else:
-        # Legado: Arrow IPC (arquivos criados antes da v1.3)
-        import pyarrow as pa
-        reader = pa.ipc.open_stream(io.BytesIO(data))
+        # Arrow IPC sem marker — datalock v1.0-v1.2 (retrocompat legado)
+        reader = ipc.open_stream(io.BytesIO(data))
         return reader.read_pandas()
 
 
@@ -326,8 +359,8 @@ def _frames_to_zip_bytes(
 
     Estrutura do ZIP:
       index.json           → lista de {name, size_bytes, rows, cols, schema}
-      clientes.parquet     → Parquet de df_clientes
-      pedidos.parquet      → Parquet de df_pedidos
+      clientes.parquet     → Arrow IPC de df_clientes
+      pedidos.parquet      → Arrow IPC de df_pedidos
       ...
 
     Returns:
@@ -395,6 +428,196 @@ def _zip_bytes_to_single_frame(zip_bytes: bytes, frame: str) -> pd.DataFrame:
 
 
 # ---------------------------------------------------------------------------
+# Serialização multi-frame com ACL (Access Control per Frame)
+# ---------------------------------------------------------------------------
+
+def _frames_to_acl_zip_bytes(
+    frames: Dict[str, pd.DataFrame],
+    frame_access_levels: Dict[str, str],
+    master_key_bytes: bytes,
+    salt_kdf: bytes,
+    parquet_compression: str = "zstd",
+    cipher_str: str = "AES256GCM",
+) -> Tuple[bytes, List[Dict]]:
+    """
+    Serializa frames em ZIP onde cada frame é cifrado com sua própria DEK de nível.
+
+    Estrutura do ZIP resultante:
+      index.json                  → lista de metadados com access_level por frame
+      clientes_nonce.bin          → nonce (12 bytes) para o frame "clientes"
+      clientes_tag.bin            → auth tag GCM (16 bytes)
+      clientes.parquet.enc        → Parquet cifrado com DEK_clientes
+      salarios_nonce.bin          → nonce para o frame "salarios"
+      salarios_tag.bin            → auth tag GCM
+      salarios.parquet.enc        → Parquet cifrado com DEK_salarios
+      ...
+
+    O ZIP inteiro é depois cifrado pela DEK principal do arquivo via _pack_v2_body,
+    adicionando uma segunda camada de proteção. A DEK por frame protege o conteúdo
+    dentro do ZIP — um adversário que extraísse o ZIP sem decifrar o arquivo externo
+    ainda precisaria das DEKs de cada nível para ler qualquer frame.
+
+    Args:
+        frames:              Dict[nome → DataFrame].
+        frame_access_levels: Dict[nome → access_level]. Frames sem entrada
+                             usam o nível padrão "internal".
+        master_key_bytes:    Master key para derivar DEKs por nível.
+        salt_kdf:            Salt único do arquivo (já gerado antes de chamar esta função).
+        parquet_compression: Compressão Parquet interna.
+        cipher_str:          Algoritmo AEAD.
+
+    Returns:
+        (zip_bytes_cifrado, index_list)
+    """
+    buf = io.BytesIO()
+    index: List[Dict] = []
+    _require_cryptography()
+
+    with zipfile.ZipFile(buf, mode="w", compression=zipfile.ZIP_STORED) as zf:
+        for name, df in frames.items():
+            level = frame_access_levels.get(name, "internal")
+            frame_dek = _derive_frame_dek(master_key_bytes, salt_kdf, level)
+
+            parquet_bytes = _df_to_bytes(df, parquet_compression=parquet_compression)
+            nonce = os.urandom(NONCE_LEN)
+            ct, tag = _encrypt(frame_dek, nonce, parquet_bytes, cipher_str)
+
+            enc_filename = f"{name}.parquet.enc"
+            zf.writestr(f"{name}_nonce.bin", nonce)
+            zf.writestr(f"{name}_tag.bin", tag)
+            zf.writestr(enc_filename, ct)
+
+            index.append({
+                "name":         name,
+                "filename":     enc_filename,
+                "access_level": level,
+                "size_bytes":   len(ct),
+                "rows":         df.shape[0],
+                "cols":         df.shape[1],
+                "schema":       {c: str(t) for c, t in df.dtypes.items()},
+                "acl_encrypted": True,
+            })
+
+        zf.writestr(_MULTI_FRAME_INDEX, json.dumps(index, ensure_ascii=False))
+
+    return buf.getvalue(), index
+
+
+def _acl_zip_bytes_to_frames(
+    zip_bytes: bytes,
+    master_key_bytes: bytes,
+    salt_kdf: bytes,
+    allowed_levels: Optional[List[str]] = None,
+    cipher_str: str = "AES256GCM",
+) -> Dict[str, pd.DataFrame]:
+    """
+    Desserializa ZIP com ACL, decrifrando apenas os frames autorizados.
+
+    Args:
+        zip_bytes:       ZIP em memória (payload do arquivo .dlk já decifrado).
+        master_key_bytes: Master key para derivar DEKs.
+        salt_kdf:        Salt do arquivo.
+        allowed_levels:  Lista de níveis que o usuário pode acessar.
+                         None = acesso a todos os níveis (admin).
+        cipher_str:      Algoritmo AEAD.
+
+    Returns:
+        Dict[nome → DataFrame] contendo apenas os frames autorizados.
+        Frames de nível não autorizado são omitidos sem erro — o chamador
+        recebe apenas o que pode ver.
+
+    Raises:
+        PermissionError: Se nenhum frame estiver acessível com os níveis fornecidos.
+    """
+    buf = io.BytesIO(zip_bytes)
+    frames: Dict[str, pd.DataFrame] = {}
+    skipped: List[str] = []
+
+    with zipfile.ZipFile(buf, mode="r") as zf:
+        index: List[Dict] = json.loads(zf.read(_MULTI_FRAME_INDEX).decode("utf-8"))
+
+        for entry in index:
+            name   = entry["name"]
+            level  = entry.get("access_level", "internal")
+            is_acl = entry.get("acl_encrypted", False)
+
+            # Verifica autorização — None significa acesso total
+            if allowed_levels is not None and level not in allowed_levels:
+                skipped.append(f"{name} (level={level})")
+                logger.debug("ACL: frame '%s' ignorado (level=%s não autorizado)", name, level)
+                continue
+
+            if is_acl:
+                # Frame cifrado por nível — deriva DEK específica e decifra
+                frame_dek = _derive_frame_dek(master_key_bytes, salt_kdf, level)
+                nonce = zf.read(f"{name}_nonce.bin")
+                tag   = zf.read(f"{name}_tag.bin")
+                ct    = zf.read(entry["filename"])
+                try:
+                    parquet_bytes = _decrypt(frame_dek, nonce, ct, tag, cipher_str)
+                except RuntimeError:
+                    # DEK incorreta para este nível — não deve acontecer se
+                    # master_key e salt_kdf estiverem corretos
+                    logger.error("ACL: falha ao decifrar frame '%s' (DEK inválida?)", name)
+                    skipped.append(f"{name} (decryption_failed)")
+                    continue
+            else:
+                # Frame sem ACL (retrocompatível com pack_frames clássico)
+                parquet_bytes = zf.read(entry["filename"])
+
+            frames[name] = _bytes_to_df(parquet_bytes)
+
+    if skipped:
+        logger.info("ACL: frames omitidos por nível de acesso: %s", skipped)
+
+    if not frames and skipped:
+        raise PermissionError(
+            f"Nenhum frame acessível com os níveis fornecidos ({allowed_levels}). "
+            f"Frames presentes mas não autorizados: {[s.split(' ')[0] for s in skipped]}"
+        )
+
+    return frames
+
+
+def _acl_zip_bytes_to_single_frame(
+    zip_bytes: bytes,
+    master_key_bytes: bytes,
+    salt_kdf: bytes,
+    frame: str,
+    allowed_levels: Optional[List[str]] = None,
+    cipher_str: str = "AES256GCM",
+) -> pd.DataFrame:
+    """Extrai um único frame ACL do ZIP, verificando autorização."""
+    buf = io.BytesIO(zip_bytes)
+    with zipfile.ZipFile(buf, mode="r") as zf:
+        index: List[Dict] = json.loads(zf.read(_MULTI_FRAME_INDEX).decode("utf-8"))
+        entry = next((e for e in index if e["name"] == frame), None)
+        if entry is None:
+            available = [e["name"] for e in index]
+            raise KeyError(f"Frame '{frame}' não encontrado. Disponíveis: {available}")
+
+        level  = entry.get("access_level", "internal")
+        is_acl = entry.get("acl_encrypted", False)
+
+        if allowed_levels is not None and level not in allowed_levels:
+            raise PermissionError(
+                f"Frame '{frame}' requer nível '{level}'. "
+                f"Níveis autorizados: {allowed_levels}"
+            )
+
+        if is_acl:
+            frame_dek = _derive_frame_dek(master_key_bytes, salt_kdf, level)
+            nonce = zf.read(f"{frame}_nonce.bin")
+            tag   = zf.read(f"{frame}_tag.bin")
+            ct    = zf.read(entry["filename"])
+            parquet_bytes = _decrypt(frame_dek, nonce, ct, tag, cipher_str)
+        else:
+            parquet_bytes = zf.read(entry["filename"])
+
+    return _bytes_to_df(parquet_bytes)
+
+
+# ---------------------------------------------------------------------------
 # Primitivos criptográficos
 # ---------------------------------------------------------------------------
 
@@ -433,6 +656,94 @@ def _derive_hek(master_key: bytes, salt_kdf: bytes) -> bytes:
         length=32,
         salt=salt_kdf,
         info=b"datalock-hek-v1",
+    ).derive(master_key)
+
+
+def _derive_mak(master_key: bytes, salt_kdf: bytes) -> bytes:
+    """
+    Deriva a Message Authentication Key (MAK) via HKDF-SHA256 (RFC 5869).
+
+    Usada exclusivamente para o FILE_HMAC — autenticação do layout binário
+    completo do arquivo. Separada da DEK e da HEK por domínio (info=) distinto,
+    garantindo que nenhuma das três chaves possa ser derivada a partir das outras,
+    mesmo com acesso ao salt_kdf em claro.
+
+    Sem essa separação, a master_key seria usada simultaneamente como input do
+    HKDF (para DEK/HEK) e como chave HMAC direta — reuso de material de chave
+    em contextos diferentes, violando o princípio de separação de domínio do
+    NIST SP 800-108r1 e da RFC 5869 §3.
+
+    Referências:
+      - RFC 5869 §3: "the use of the same key for different cryptographic
+        operations is strongly discouraged"
+      - NIST SP 800-108r1: domain separation via label/context in KDF
+    """
+    _require_cryptography()
+    from cryptography.hazmat.primitives.kdf.hkdf import HKDF
+    from cryptography.hazmat.primitives import hashes
+
+    return HKDF(
+        algorithm=hashes.SHA256(),
+        length=32,
+        salt=salt_kdf,
+        info=b"datalock-mak-v1",
+    ).derive(master_key)
+
+
+def _derive_frame_dek(master_key: bytes, salt_kdf: bytes, access_level: str) -> bytes:
+    """
+    Deriva uma Data Encryption Key (DEK) específica para um nível de acesso.
+
+    Cada nível de acesso produz uma DEK distinta, derivada da mesma master_key
+    mas com campo `info` diferente — separação de domínio criptográfico completa.
+
+    Modelo de controle de acesso:
+      master_key  →  HKDF(salt, info="frame-dek-v1:{level}")  →  DEK_level
+
+    Consequências de segurança:
+      1. Um usuário com acesso ao nível "user" recebe apenas DEK_user.
+         DEK_admin é computacionalmente indistinguível de ruído aleatório
+         para quem não possui a master_key — não pode ser derivada a partir
+         de DEK_user ou de qualquer combinação de DEKs conhecidas.
+
+      2. O comprometimento de DEK_user não expõe DEK_admin, nem a master_key,
+         nem DEKs de outros níveis (propriedade de forward secrecy por nível).
+
+      3. A master_key nunca é transmitida — apenas as DEKs derivadas são
+         distribuídas por nível, tipicamente via KMS ou variável de ambiente
+         específica por perfil de usuário.
+
+    Hierarquia recomendada de níveis:
+      "public"      → dados sem restrição de acesso
+      "internal"    → dados internos da organização
+      "confidential"→ dados sensíveis (RH, jurídico)
+      "restricted"  → dados altamente sensíveis (executivos, M&A)
+      "secret"      → dados pessoais de alta criticidade (LGPD art. 11)
+
+    A hierarquia é convencional — o sistema criptográfico trata os níveis
+    como strings opacas. O controle de quem recebe qual DEK é responsabilidade
+    do KMS ou do sistema de distribuição de chaves da organização.
+
+    Args:
+        master_key:   Chave mestre da organização (bytes).
+        salt_kdf:     Salt único por arquivo (32 bytes de os.urandom).
+        access_level: String identificando o nível (ex: "user", "admin").
+
+    Returns:
+        DEK de 32 bytes única para (master_key, salt_kdf, access_level).
+    """
+    _require_cryptography()
+    from cryptography.hazmat.primitives.kdf.hkdf import HKDF
+    from cryptography.hazmat.primitives import hashes
+
+    # O info= inclui o access_level como sufixo — garante que níveis distintos
+    # produzam DEKs distintas mesmo com mesma master_key e salt_kdf.
+    info = f"datalock-frame-dek-v1:{access_level}".encode("utf-8")
+    return HKDF(
+        algorithm=hashes.SHA256(),
+        length=32,
+        salt=salt_kdf,
+        info=info,
     ).derive(master_key)
 
 
@@ -512,14 +823,54 @@ def _aes_gcm_encrypt(dek, nonce, plaintext): return _encrypt(dek, nonce, plainte
 def _aes_gcm_decrypt(dek, nonce, ct, tag):   return _decrypt(dek, nonce, ct, tag, "AES256GCM")
 
 
-def _compute_file_hmac(master_key: bytes, data: bytes) -> bytes:
-    """HMAC-SHA256 sobre os dados do arquivo (header + payload cifrado)."""
-    return _hmac_module.new(master_key, data, hashlib.sha256).digest()
+def _compute_file_hmac(master_key: bytes, data: bytes, salt_kdf: Optional[bytes] = None) -> bytes:
+    """
+    HMAC-SHA256 sobre os dados do arquivo (header + payload cifrado).
+
+    Quando salt_kdf é fornecido (arquivos v2/v3), a chave HMAC é a MAK derivada
+    via HKDF — separação de domínio completa entre DEK, HEK e MAK.
+    Quando salt_kdf é None (arquivos v1 legados ou v4 sem key), usa master_key
+    diretamente para manter retrocompatibilidade.
+    """
+    hmac_key = _derive_mak(master_key, salt_kdf) if salt_kdf is not None else master_key
+    return _hmac_module.new(hmac_key, data, hashlib.sha256).digest()
 
 
-def _verify_file_hmac(master_key: bytes, data: bytes, expected: bytes) -> bool:
+def _verify_file_hmac(master_key: bytes, data: bytes, expected: bytes, salt_kdf: Optional[bytes] = None) -> bool:
     """Verifica HMAC em tempo constante (resistente a timing attack)."""
-    return _hmac_module.compare_digest(_compute_file_hmac(master_key, data), expected)
+    return _hmac_module.compare_digest(
+        _compute_file_hmac(master_key, data, salt_kdf), expected
+    )
+
+
+def _parse_v2_header_only(raw: bytes, master_key_bytes: bytes) -> Dict:
+    """
+    Decifra e retorna APENAS o cabeçalho de um arquivo v2/v3, sem tocar no payload.
+
+    Usado por verify() e inspect() para auditoria de metadados sem carregar
+    o payload de dados em memória. Garante que a propriedade de "auditabilidade
+    sem exposição do conteúdo" seja real na implementação, não apenas declarada.
+
+    O payload nunca é decifrado, descomprimido ou deserializado — existe no
+    buffer raw[] como bytes cifrados inacessíveis até que load() seja chamado
+    com intenção explícita de ler os dados.
+    """
+    offset = len(MAGIC) + 1  # skip MAGIC + VERSION
+    cipher_byte = raw[offset]; offset += 1
+    cipher_str  = _CIPHER_BYTE_TO_STR.get(cipher_byte, "AES256GCM")
+
+    salt_kdf     = raw[offset:offset + SALT_KDF_LEN];  offset += SALT_KDF_LEN
+    nonce_header = raw[offset:offset + NONCE_LEN];      offset += NONCE_LEN
+    header_ct_len = struct.unpack(HEADER_LEN_FMT, raw[offset:offset + 4])[0]; offset += 4
+    header_ct_with_tag = raw[offset:offset + header_ct_len]
+    header_ct  = header_ct_with_tag[:-AUTH_TAG_LEN]
+    header_tag = header_ct_with_tag[-AUTH_TAG_LEN:]
+
+    hek = _derive_hek(master_key_bytes, salt_kdf)
+    header_plain = _decrypt(hek, nonce_header, header_ct, header_tag, cipher_str)
+    return json.loads(header_plain.decode("utf-8")), salt_kdf
+    # payload nunca tocado — offset após header_ct_with_tag aponta para
+    # NONCE_PAYLOAD seguido do bloco cifrado, que permanece intocado.
 
 
 # ---------------------------------------------------------------------------
@@ -552,6 +903,7 @@ _NO_KEY_HMAC_KEY = b"datalock-no-key-integrity-v1"
 
 def _check_expiry(header: Dict) -> None:
     """Lança ExpiredFileError se o arquivo passou do prazo definido em expires_at."""
+    import warnings as _warnings
     expires_at = header.get("expires_at")
     if not expires_at:
         return
@@ -564,12 +916,22 @@ def _check_expiry(header: Dict) -> None:
         if now > expiry:
             raise ExpiredFileError(
                 f"Arquivo expirado em {expiry.strftime('%Y-%m-%d')}. "
-                f"Conforme a política de retenção LGPD (Art. 16), "                f"dados após o prazo devem ser eliminados."
+                f"Conforme a política de retenção LGPD (Art. 16), "
+                f"dados após o prazo devem ser eliminados."
             )
     except ExpiredFileError:
         raise
-    except Exception:
-        pass  # Formato de data inválido — ignora silenciosamente
+    except Exception as e:
+        # Formato de data inválido — alerta em vez de ignorar silenciosamente.
+        # Um campo expires_at mal-formatado pode mascarar uma expiração real;
+        # o comportamento seguro é alertar, não prosseguir sem aviso.
+        _warnings.warn(
+            f"Campo 'expires_at' com valor inválido ({expires_at!r}): {e}. "
+            "Verificação de expiração ignorada para este arquivo. "
+            "Corrija o campo para garantir a política de retenção LGPD (Art. 16).",
+            UserWarning,
+            stacklevel=3,
+        )
 
 
 class ExpiredFileError(ValueError):
@@ -584,12 +946,13 @@ def _pack_v2_body(
     cipher_str: str,
     compress: bool,
     version_byte: int = VERSION_V2,
-) -> bytes:
+) -> Tuple[bytes, bytes]:
     """
     Constrói o corpo de um arquivo .dlk v2/v3 (sem o FILE_HMAC final).
 
     version_byte: VERSION_V2 (single-frame) ou VERSION_V3 (multi-frame).
-    Retorna o body SEM o FILE_HMAC — o chamador adiciona o HMAC.
+    Retorna (body, salt_kdf) — o salt_kdf é necessário para derivar a MAK
+    e calcular o FILE_HMAC com separação de domínio completa.
     """
     cipher_byte = _CIPHER_STR_TO_BYTE[cipher_str]
 
@@ -605,7 +968,7 @@ def _pack_v2_body(
     ct_header, tag_header = _encrypt(hek, nonce_header, header_plain, cipher_str)
     header_ct_with_tag = ct_header + tag_header
 
-    return (
+    body = (
         MAGIC
         + bytes([version_byte])
         + bytes([cipher_byte])
@@ -617,6 +980,7 @@ def _pack_v2_body(
         + ct_payload
         + tag_payload
     )
+    return body, salt_kdf
 
 
 def _pack_v4_body(header: Dict, plaintext_bytes: bytes) -> bytes:
@@ -637,11 +1001,19 @@ def _pack_v4_body(header: Dict, plaintext_bytes: bytes) -> bytes:
 
 
 def _write_lgs(
-    output: Path, body: bytes, master_key_bytes: Optional[bytes]
+    output: Path, body: bytes, master_key_bytes: Optional[bytes], salt_kdf: Optional[bytes] = None
 ) -> None:
-    """Grava body + HMAC em disco de forma atômica (write → rename)."""
-    hmac_key = master_key_bytes if master_key_bytes is not None else _NO_KEY_HMAC_KEY
-    file_hmac = _compute_file_hmac(hmac_key, body)
+    """
+    Grava body + HMAC em disco de forma atômica (write → rename).
+
+    salt_kdf: quando fornecido (arquivos v2/v3), o FILE_HMAC é calculado com a
+    MAK derivada via HKDF — separação de domínio completa. Para v1 e v4 (sem
+    salt_kdf disponível), usa master_key_bytes diretamente para retrocompatibilidade.
+    A escrita atômica via rename garante que o arquivo destino nunca fica num
+    estado parcialmente escrito em caso de interrupção do processo.
+    """
+    hmac_key_bytes = master_key_bytes if master_key_bytes is not None else _NO_KEY_HMAC_KEY
+    file_hmac = _compute_file_hmac(hmac_key_bytes, body, salt_kdf)
     tmp = output.with_suffix(".dlk.tmp")
     try:
         output.parent.mkdir(parents=True, exist_ok=True)
@@ -767,7 +1139,7 @@ class SecureFile:
             df = _secure(df, salt=salt_masking)
             content_type = SecureFile.CONTENT_TYPE_ANON
         else:
-            content_type = SecureFile.CONTENT_TYPE_ANON
+            content_type = SecureFile.CONTENT_TYPE_RAW
 
         parquet_comp = "zstd" if compress else "lz4"
         plaintext_bytes = _df_to_bytes(df, parquet_compression=parquet_comp)
@@ -783,7 +1155,7 @@ class SecureFile:
             "shape":                list(df.shape),
             "schema":               {c: str(t) for c, t in df.dtypes.items()},
             "masking_applied":      anonymize,
-            "compression":          f"parquet_{parquet_comp}",
+            "compression":          f"ipc_{parquet_comp}",
             "kdf":                  "none",
             "encryption":           "none",
             "integrity":            "HMAC-SHA256 (public key — tamper detection only)",
@@ -827,7 +1199,7 @@ class SecureFile:
 
         Args:
             path:          Caminho para o arquivo `.dlk`.
-            apply_masking: Se True, aplica mascaramento PII na leitura.
+            anonymize:     Se True, aplica mascaramento PII na leitura.
             salt_masking:  Salt para mascaramento.
             verbose:       Exibe relatório de detecção PII.
 
@@ -914,8 +1286,8 @@ class SecureFile:
             source_path:   Arquivo de origem (.csv, .xlsx, .parquet, .json).
             output_path:   Caminho de saída (ex: "clientes.dlk").
             master_key:    Chave mestre para criptografia (≥ 16 chars).
-            apply_masking: Se True, aplica mascaramento ANTES de criptografar.
-            salt_masking:  Salt HMAC para mascaramento (obrigatório se apply_masking=True).
+            anonymize:     Se True, aplica mascaramento ANTES de criptografar.
+            salt_masking:  Salt HMAC para mascaramento (obrigatório se anonymize=True).
             label:         Rótulo livre para o header (auditoria).
             compress:      Se True (padrão), Parquet/zstd; False → Parquet/lz4.
             overwrite:     Se True, sobrescreve arquivo existente.
@@ -962,8 +1334,8 @@ class SecureFile:
             expires_at=expires_at,
         )
 
-        body = _pack_v2_body(master_key_bytes, header, plaintext_bytes, _get_best_cipher(), compress)
-        _write_lgs(output, body, master_key_bytes)
+        body, salt_kdf = _pack_v2_body(master_key_bytes, header, plaintext_bytes, _get_best_cipher(), compress)
+        _write_lgs(output, body, master_key_bytes, salt_kdf)
 
         elapsed = time.perf_counter() - t0
         logger.info(
@@ -1055,8 +1427,8 @@ class SecureFile:
             expires_at=expires_at,
         )
 
-        body = _pack_v2_body(master_key_bytes, header, plaintext_bytes, _get_best_cipher(), compress)
-        _write_lgs(output, body, master_key_bytes)
+        body, salt_kdf = _pack_v2_body(master_key_bytes, header, plaintext_bytes, _get_best_cipher(), compress)
+        _write_lgs(output, body, master_key_bytes, salt_kdf)
 
         elapsed = time.perf_counter() - t0
         packed_size = output.stat().st_size
@@ -1141,7 +1513,7 @@ class SecureFile:
             "n_frames":      len(frames),
             "frame_names":   [e["name"] for e in index],
             "frame_index":   index,
-            "compression":   f"parquet_{parquet_comp}",
+            "compression":   f"ipc_{parquet_comp}",
             "kdf":           "HKDF-SHA256-v2",
             "encryption":    _get_best_cipher(),
             "integrity":     "HMAC-SHA256",
@@ -1149,8 +1521,8 @@ class SecureFile:
             "metadata":      metadata or {},
         }
 
-        body = _pack_v2_body(master_key_bytes, header, zip_bytes, _get_best_cipher(), compress, version_byte=VERSION_V3)
-        _write_lgs(output, body, master_key_bytes)
+        body, salt_kdf = _pack_v2_body(master_key_bytes, header, zip_bytes, _get_best_cipher(), compress, version_byte=VERSION_V3)
+        _write_lgs(output, body, master_key_bytes, salt_kdf)
 
         elapsed = time.perf_counter() - t0
         packed_size = output.stat().st_size
@@ -1170,6 +1542,319 @@ class SecureFile:
             "compression_ratio": round(len(zip_bytes) / max(packed_size, 1), 3),
             "elapsed_seconds":   round(elapsed, 3),
         }
+
+    # ------------------------------------------------------------------
+    # ACL multi-frame: DEK por nível de acesso
+    # ------------------------------------------------------------------
+
+    @classmethod
+    def pack_frames_acl(
+        cls,
+        frames: Dict[str, pd.DataFrame],
+        output_path: Union[str, Path],
+        key: str,
+        frame_access_levels: Optional[Dict[str, str]] = None,
+        label: str = "",
+        compress: bool = True,
+        overwrite: bool = False,
+        metadata: Optional[Dict[str, Any]] = None,
+        expires_at: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        """
+        Empacota múltiplos DataFrames com controle de acesso por nível (ACL).
+
+        Cada frame é cifrado com uma DEK derivada do seu nível de acesso.
+        Usuários recebem apenas as DEKs dos níveis a que têm direito — frames
+        de nível superior são ilegíveis para eles mesmo após decifrar o arquivo.
+
+        Isso resolve o problema de RAG corporativo: um pipeline de busca semântica
+        que consulta um arquivo com frames de RH, finanças e dados públicos pode
+        ser configurado para que o modelo de linguagem nunca veja os frames
+        confidenciais, independente da query do usuário.
+
+        Modelo de derivação de chaves:
+          master_key  →  HKDF(salt, "datalock-frame-dek-v1:{level}")  →  DEK_level
+
+        Os níveis recomendados (convenção, não enforçados):
+          "public"        → sem restrição
+          "internal"      → colaboradores gerais
+          "confidential"  → gestores, jurídico
+          "restricted"    → diretoria, RH sênior
+          "secret"        → dados pessoais LGPD art. 11
+
+        Exemplo — RAG corporativo com múltiplos níveis:
+            SecureFile.pack_frames_acl(
+                frames={
+                    "produtos":  df_produtos,      # público
+                    "politicas": df_politicas,      # interno
+                    "salarios":  df_salarios,       # restrito
+                    "processos": df_processos_rh,   # confidencial
+                },
+                frame_access_levels={
+                    "produtos":  "public",
+                    "politicas": "internal",
+                    "salarios":  "restricted",
+                    "processos": "confidential",
+                },
+                output_path="base_rag.dlk",
+                key="master-key-vault",
+            )
+
+            # Usuário comum — vê apenas public + internal
+            frames = SecureFile.load_frames_acl(
+                "base_rag.dlk", key="master-key-vault",
+                allowed_levels=["public", "internal"],
+            )
+
+            # Admin — vê tudo
+            frames = SecureFile.load_frames_acl(
+                "base_rag.dlk", key="master-key-vault",
+                allowed_levels=None,  # None = acesso total
+            )
+
+        Args:
+            frames:              Dict[nome → DataFrame].
+            output_path:         Caminho do .dlk de saída.
+            key:                 Master key (≥ 16 chars).
+            frame_access_levels: Dict[nome_frame → nível]. Padrão "internal".
+            label:               Rótulo livre para auditoria.
+            compress:            Compressão Parquet interna.
+            overwrite:           Sobrescreve arquivo existente.
+            metadata:            Metadados extras para o cabeçalho.
+            expires_at:          Data de expiração ISO 8601.
+
+        Returns:
+            Dict com metadados: n_frames, frame_names, access_levels, etc.
+        """
+        output = Path(output_path)
+        _check_output(output, overwrite)
+        master_key_bytes = _validate_key(key)
+
+        if not isinstance(frames, dict) or not frames:
+            raise ValueError("frames deve ser um dict não-vazio de {str: DataFrame}.")
+
+        acl = frame_access_levels or {}
+        # Valida que todos os frames declarados em acl existem
+        unknown = set(acl) - set(frames)
+        if unknown:
+            raise ValueError(
+                f"frame_access_levels contém frames inexistentes: {unknown}. "
+                f"Frames disponíveis: {set(frames.keys())}"
+            )
+
+        t0 = time.perf_counter()
+        parquet_comp = "zstd" if compress else "lz4"
+        cipher_str   = _get_best_cipher()
+
+        # Gera salt_kdf aqui para passá-lo a _frames_to_acl_zip_bytes
+        # (as DEKs por nível precisam do mesmo salt do arquivo)
+        salt_kdf = os.urandom(SALT_KDF_LEN)
+
+        zip_bytes, index = _frames_to_acl_zip_bytes(
+            frames, acl, master_key_bytes, salt_kdf, parquet_comp, cipher_str
+        )
+
+        total_rows = sum(e["rows"] for e in index)
+        access_level_map = {e["name"]: e["access_level"] for e in index}
+
+        header = {
+            "format":        "lgs",
+            "version":       "3.1",          # 3.1 = multi-frame com ACL
+            "content_type":  SecureFile.CONTENT_TYPE_MULTI,
+            "acl_enabled":   True,
+            "label":         label,
+            "created_at":    datetime.now(timezone.utc).isoformat(),
+            "created_by":    f"datalock/{_logus_version()}",
+            "n_frames":      len(frames),
+            "frame_names":   [e["name"] for e in index],
+            "frame_index":   index,
+            "access_levels": access_level_map,
+            "compression":   f"ipc_{parquet_comp}",
+            "kdf":           "HKDF-SHA256-v2",
+            "encryption":    cipher_str,
+            "integrity":     "HMAC-SHA256+MAK",
+            "plaintext_size_bytes": len(zip_bytes),
+            "metadata":      metadata or {},
+            "expires_at":    expires_at or None,
+        }
+
+        # Usa salt_kdf pré-gerado para construir o body
+        # _pack_v2_body geraria um novo salt — precisamos reutilizar o mesmo
+        # que foi usado nas DEKs por frame. Por isso montamos manualmente.
+        hek = _derive_hek(master_key_bytes, salt_kdf)
+        dek = _derive_dek(master_key_bytes, salt_kdf)
+
+        nonce_payload = os.urandom(NONCE_LEN)
+        ct_payload, tag_payload = _encrypt(dek, nonce_payload, zip_bytes, cipher_str)
+
+        header_plain = json.dumps(header, ensure_ascii=False).encode("utf-8")
+        nonce_header = os.urandom(NONCE_LEN)
+        ct_header, tag_header = _encrypt(hek, nonce_header, header_plain, cipher_str)
+        header_ct_with_tag = ct_header + tag_header
+
+        cipher_byte = _CIPHER_STR_TO_BYTE[cipher_str]
+        body = (
+            MAGIC
+            + bytes([VERSION_V3])
+            + bytes([cipher_byte])
+            + salt_kdf
+            + nonce_header
+            + struct.pack(HEADER_LEN_FMT, len(header_ct_with_tag))
+            + header_ct_with_tag
+            + nonce_payload
+            + ct_payload
+            + tag_payload
+        )
+        _write_lgs(output, body, master_key_bytes, salt_kdf)
+
+        elapsed = time.perf_counter() - t0
+        packed_size = output.stat().st_size
+        logger.info(
+            "SecureFile.pack_frames_acl | n_frames=%d | levels=%s | %.3fs",
+            len(frames), list(set(acl.values())), elapsed,
+        )
+        return {
+            "output_path":       str(output),
+            "content_type":      SecureFile.CONTENT_TYPE_MULTI,
+            "acl_enabled":       True,
+            "n_frames":          len(frames),
+            "frame_names":       [e["name"] for e in index],
+            "access_levels":     access_level_map,
+            "total_rows":        total_rows,
+            "original_size_kb":  round(len(zip_bytes) / 1024, 1),
+            "packed_size_kb":    round(packed_size / 1024, 1),
+            "elapsed_seconds":   round(elapsed, 3),
+        }
+
+    @classmethod
+    def load_frames_acl(
+        cls,
+        path: Union[str, Path],
+        key: str,
+        allowed_levels: Optional[List[str]] = None,
+        salt_masking: Optional[str] = None,
+        verbose: bool = False,
+    ) -> Dict[str, pd.DataFrame]:
+        """
+        Lê um arquivo multi-frame com ACL, retornando apenas os frames autorizados.
+
+        O sistema decifra apenas os frames cujo nível de acesso está em
+        `allowed_levels`. Frames de outros níveis são silenciosamente omitidos
+        do resultado — o chamador não vê nem o conteúdo nem um erro de
+        "frame existe mas é proibido" (security by obscurity intencional para
+        evitar enumeração de frames confidenciais).
+
+        Args:
+            path:           Caminho para o arquivo .dlk multi-frame com ACL.
+            key:            Master key.
+            allowed_levels: Lista de níveis autorizados para este usuário.
+                            None = acesso total (admin).
+                            Exemplo: ["public", "internal"]
+            salt_masking:   Aplica mascaramento adicional nos frames lidos.
+            verbose:        Log de PII detectada.
+
+        Returns:
+            Dict[nome_frame → DataFrame] — apenas frames autorizados.
+
+        Raises:
+            PermissionError: Se nenhum frame estiver acessível.
+            TypeError:       Se o arquivo não for multi-frame.
+
+        Exemplo:
+            # Usuário padrão — vê apenas dados públicos e internos
+            frames = SecureFile.load_frames_acl(
+                "base_rag.dlk", key=KEY,
+                allowed_levels=["public", "internal"],
+            )
+            # frames NÃO contém "salarios" nem "processos"
+            # O modelo de linguagem que usa esses frames nunca vê dados restritos
+        """
+        p = Path(path)
+        if not p.exists():
+            raise FileNotFoundError(f"Arquivo não encontrado: {path}")
+
+        t0 = time.perf_counter()
+        master_key_bytes = key.encode("utf-8")
+        header, payload_decrypted = cls._decrypt_file(p, master_key_bytes)
+
+        cls._assert_multi_frame(header, p)
+        payload_decrypted = _decompress_payload(payload_decrypted, header)
+
+        # Extrai salt_kdf do arquivo para reuso nas DEKs de frame
+        raw = p.read_bytes()
+        salt_kdf = raw[7:7 + SALT_KDF_LEN]  # MAGIC(5)+VERSION(1)+CIPHER(1)
+
+        acl_enabled = header.get("acl_enabled", False)
+        if acl_enabled:
+            cipher_str = header.get("encryption", "AES256GCM")
+            frames = _acl_zip_bytes_to_frames(
+                payload_decrypted, master_key_bytes, salt_kdf,
+                allowed_levels, cipher_str,
+            )
+        else:
+            # Arquivo multi-frame sem ACL — usa load_frames clássico
+            frames = _zip_bytes_to_frames(payload_decrypted)
+
+        if salt_masking is not None:
+            frames = {
+                name: secure_dataframe(df, salt=salt_masking, verbose=verbose)
+                for name, df in frames.items()
+            }
+
+        elapsed = time.perf_counter() - t0
+        logger.info(
+            "SecureFile.load_frames_acl | %s | allowed=%s | loaded=%s | %.3fs",
+            p.name, allowed_levels, list(frames.keys()), elapsed,
+        )
+        return frames
+
+    @classmethod
+    def load_frame_acl(
+        cls,
+        path: Union[str, Path],
+        key: str,
+        *,
+        frame: str,
+        allowed_levels: Optional[List[str]] = None,
+        salt_masking: Optional[str] = None,
+    ) -> pd.DataFrame:
+        """
+        Lê um único frame de arquivo multi-frame com ACL.
+
+        Equivalente a load_frames_acl()[frame], mas sem desserializar os
+        frames não solicitados.
+
+        Raises:
+            PermissionError: Se o frame solicitado estiver num nível não autorizado.
+            KeyError:        Se o frame não existir.
+        """
+        p = Path(path)
+        if not p.exists():
+            raise FileNotFoundError(f"Arquivo não encontrado: {path}")
+
+        master_key_bytes = key.encode("utf-8")
+        header, payload_decrypted = cls._decrypt_file(p, master_key_bytes)
+        cls._assert_multi_frame(header, p)
+        payload_decrypted = _decompress_payload(payload_decrypted, header)
+
+        raw = p.read_bytes()
+        salt_kdf = raw[7:7 + SALT_KDF_LEN]
+
+        acl_enabled = header.get("acl_enabled", False)
+        cipher_str  = header.get("encryption", "AES256GCM")
+
+        if acl_enabled:
+            df = _acl_zip_bytes_to_single_frame(
+                payload_decrypted, master_key_bytes, salt_kdf,
+                frame, allowed_levels, cipher_str,
+            )
+        else:
+            df = _zip_bytes_to_single_frame(payload_decrypted, frame)
+
+        if salt_masking is not None:
+            df = secure_dataframe(df, salt=salt_masking)
+
+        return df
 
     # ------------------------------------------------------------------
     # Escrita — bytes brutos
@@ -1219,39 +1904,38 @@ class SecureFile:
 
         t0 = time.perf_counter()
         original_size = len(payload)
+        cipher_str    = _get_best_cipher()
 
-        payload_bytes = zlib.compress(payload, level=6) if compress else payload
+        # Comprime antes de cifrar — ciphertext AEAD tem distribuição uniforme,
+        # qualquer compressor seria ineficaz sobre ele.
+        payload_bytes     = zlib.compress(payload, level=6) if compress else payload
         compression_ratio = len(payload_bytes) / max(original_size, 1)
 
-        salt_kdf = os.urandom(SALT_KDF_LEN)
-        nonce    = os.urandom(NONCE_LEN)
-        dek      = _derive_dek(master_key_bytes, salt_kdf)
-        ciphertext, auth_tag = _aes_gcm_encrypt(dek, nonce, payload_bytes)
-
         header = {
-            "format":        "lgs",
-            "version":       "1.0",
-            "content_type":  content_type,
-            "label":         label,
-            "created_at":    datetime.now(timezone.utc).isoformat(),
-            "created_by":    f"datalock/{_logus_version()}",
-            "original_size_bytes": original_size,
-            "compression":   "zlib" if compress else "none",
-            "kdf":           "HKDF-SHA256",
-            "encryption":    "AES-256-GCM",
-            "integrity":     "HMAC-SHA256",
+            "format":               "lgs",
+            "version":              "2.1",
+            "content_type":         content_type,
+            "label":                label,
+            "created_at":           datetime.now(timezone.utc).isoformat(),
+            "created_by":           f"datalock/{_logus_version()}",
+            "original_size_bytes":  original_size,
+            "compression":          "zlib" if compress else "none",
+            "kdf":                  "HKDF-SHA256-v2",
+            "encryption":           cipher_str,
+            "integrity":            "HMAC-SHA256+MAK",
             "plaintext_size_bytes": len(payload_bytes),
-            "metadata":      metadata or {},
+            "metadata":             metadata or {},
         }
-        header_bytes = json.dumps(header, ensure_ascii=False).encode("utf-8")
-        # pack_bytes usa v1 (header em claro) por simplicidade — payload já está
-        # protegido por AES-GCM + HMAC. A promoção para v2 pode ser feita futuramente.
-        body = (
-            MAGIC + bytes([VERSION_V1])
-            + struct.pack(HEADER_LEN_FMT, len(header_bytes))
-            + header_bytes + salt_kdf + nonce + ciphertext + auth_tag
+
+        # v2: header cifrado com HEK, payload cifrado com DEK,
+        # FILE_HMAC calculado com MAK — separação de domínio completa.
+        # Corrige a inconsistência anterior onde pack_bytes era o único
+        # método que deixava metadados em claro, quebrando a propriedade
+        # de auditabilidade sem exposição garantida pelo inspect().
+        body, salt_kdf = _pack_v2_body(
+            master_key_bytes, header, payload_bytes, cipher_str, compress=False
         )
-        _write_lgs(output, body, master_key_bytes)
+        _write_lgs(output, body, master_key_bytes, salt_kdf)
 
         elapsed = time.perf_counter() - t0
         packed_size = output.stat().st_size
@@ -1324,10 +2008,23 @@ class SecureFile:
         payload_decrypted = _decompress_payload(payload_decrypted, header)
         df_raw = _bytes_to_df(payload_decrypted)
 
-        # Strip canary rows transparently (user never sees them)
-        if "canary" in header or "canary" in header.get("metadata", {}):
+        # Strip canary rows do Nível 1 (arquivo) — transparente ao usuário
+        canary_meta_header = header.get("canary") or header.get("metadata", {}).get("canary")
+        if canary_meta_header or _CANARY_COL in (df_raw.columns if hasattr(df_raw, "columns") else []):
             from datalock.canary import strip_canary
             df_raw = strip_canary(df_raw)
+
+        # Injeta canary rows do Nível 2 (sessão de leitura — insider threat).
+        # As linhas são inseridas no DataFrame entregue ao usuário, de forma que
+        # qualquer exportação subsequente (CSV, banco, e-mail) carregue os fingerprints.
+        # O arquivo .dlk em disco não é modificado.
+        pipeline_id_for_read = (
+            canary_meta_header.get("pipeline_id") if canary_meta_header
+            else header.get("pipeline_id") or header.get("label") or p.stem
+        )
+        if pipeline_id_for_read:
+            from datalock.canary import inject_canary_on_read
+            df_raw, _ = inject_canary_on_read(df_raw, pipeline_id_for_read)
 
         already_masked = (
             header.get("masking_applied", False)
@@ -1377,6 +2074,11 @@ class SecureFile:
             TypeError: Se o arquivo for multi-frame ou bytes.
         """
         key = key if key is not None else master_key  # compat: master_key= is deprecated
+        if key is None:
+            raise ValueError(
+                "load_raw() requer master_key. "
+                "Forneça key='sua-chave' ou use SecureFile.load_open() para arquivos v4 sem criptografia."
+            )
         p = Path(path)
         if not p.exists():
             raise FileNotFoundError(f"Arquivo não encontrado: {path}")
@@ -1399,7 +2101,9 @@ class SecureFile:
         payload_decrypted = _decompress_payload(payload_decrypted, header)
         df = _bytes_to_df(payload_decrypted)
 
-        # Strip canary rows transparently (user never sees them)
+        # Strip canary rows do Nível 1 (arquivo).
+        # load_raw() não injeta canary de Nível 2: o chamador usa load_raw()
+        # com intenção explícita de receber dados brutos (ex: rekey, testes).
         if "canary" in header or "canary" in header.get("metadata", {}):
             from datalock.canary import strip_canary
             df = strip_canary(df)
@@ -1435,6 +2139,11 @@ class SecureFile:
             Bytes decifrados (sem desserialização).
         """
         key = key if key is not None else master_key  # compat: master_key= is deprecated
+        if key is None:
+            raise ValueError(
+                "load_bytes() requer master_key. "
+                "Forneça key='sua-chave'."
+            )
         p = Path(path)
         if not p.exists():
             raise FileNotFoundError(f"Arquivo não encontrado: {path}")
@@ -1477,6 +2186,11 @@ class SecureFile:
             df_clientes = frames["clientes"]
         """
         key = key if key is not None else master_key  # compat: master_key= is deprecated
+        if key is None:
+            raise ValueError(
+                "load_frames() requer master_key. "
+                "Forneça key='sua-chave'."
+            )
         p = Path(path)
         if not p.exists():
             raise FileNotFoundError(f"Arquivo não encontrado: {path}")
@@ -1537,6 +2251,11 @@ class SecureFile:
             df = SecureFile.load_frame("base.dlk", master_key="chave", frame="clientes")
         """
         key = key if key is not None else master_key  # compat: master_key= is deprecated
+        if key is None:
+            raise ValueError(
+                "load_frame() requer master_key. "
+                "Forneça key='sua-chave'."
+            )
         p = Path(path)
         if not p.exists():
             raise FileNotFoundError(f"Arquivo não encontrado: {path}")
@@ -1637,10 +2356,26 @@ class SecureFile:
                 return LGSInfo(False, {"error": "master_key obrigatória para arquivos criptografados"})
             master_key_bytes = key.encode("utf-8")
 
-            if not _verify_file_hmac(master_key_bytes, body, file_hmac):
+            # Para v2/v3: extrair salt_kdf do corpo para verificar HMAC com MAK
+            # (separação de domínio completa). Para v1: salt_kdf não disponível
+            # antes do HMAC, usa master_key diretamente (retrocompat).
+            salt_kdf_for_hmac: Optional[bytes] = None
+            if file_version in (VERSION_V2, VERSION_V3):
+                # salt_kdf está em posição fixa após MAGIC(5) + VERSION(1) + CIPHER(1)
+                salt_kdf_for_hmac = raw[7:7 + SALT_KDF_LEN]
+
+            if not _verify_file_hmac(master_key_bytes, body, file_hmac, salt_kdf_for_hmac):
                 return LGSInfo(False, {"error": "HMAC inválido — arquivo foi modificado após a criação"})
 
-            header, _ = cls._decrypt_file(p, master_key_bytes)
+            # Decifra APENAS o cabeçalho — payload nunca tocado
+            if file_version in (VERSION_V2, VERSION_V3):
+                header, _ = _parse_v2_header_only(raw, master_key_bytes)
+            else:
+                # v1: header em claro, sem custo de decifração
+                offset_v1 = len(MAGIC) + 1
+                header_len_v1 = struct.unpack(HEADER_LEN_FMT, raw[offset_v1:offset_v1 + 4])[0]
+                offset_v1 += 4
+                header = json.loads(raw[offset_v1:offset_v1 + header_len_v1].decode("utf-8"))
 
             info: Dict[str, Any] = {
                 "valid":             True,
@@ -1690,19 +2425,27 @@ class SecureFile:
         expires_at: Optional[str] = None,
     ) -> Dict:
         import numpy as _np
-        # Column statistics (disponíveis sem descriptografar via dd.inspect())
+        # Estatísticas de coluna acessíveis via dd.inspect() sem decifrar o payload.
+        # Para raw_dataframe (dados não mascarados), min/max de colunas numéricas
+        # são suprimidos: esses valores podem revelar distribuições de dados sensíveis
+        # (ex: faixa de renda, score mínimo) sem que o auditor precise ver o payload.
+        # Para masked_dataframe, min/max de hashes HMAC são informativamente vazios
+        # e podem ser incluídos sem risco.
+        expose_range = (content_type != SecureFile.CONTENT_TYPE_RAW)
         col_stats = {}
         for col in df.columns:
             try:
                 s = df[col]
                 stat = {
-                    "dtype":      str(df[col].dtype),
-                    "n_nulls":    int(s.isna().sum()),
-                    "n_unique":   int(s.nunique()),
+                    "dtype":    str(df[col].dtype),
+                    "n_nulls":  int(s.isna().sum()),
+                    "n_unique": int(s.nunique()),
                 }
-                if hasattr(s, "dtype") and str(s.dtype) in ("float64","float32","int64","int32","int16","int8"):
-                    stat["min"]  = float(s.min()) if not s.empty else None
-                    stat["max"]  = float(s.max()) if not s.empty else None
+                if expose_range and hasattr(s, "dtype") and str(s.dtype) in (
+                    "float64", "float32", "int64", "int32", "int16", "int8"
+                ):
+                    stat["min"] = float(s.min()) if not s.empty else None
+                    stat["max"] = float(s.max()) if not s.empty else None
                 col_stats[col] = stat
             except Exception:
                 col_stats[col] = {"dtype": str(df[col].dtype) if col in df.columns else "unknown"}
@@ -1719,10 +2462,10 @@ class SecureFile:
             "column_stats":         col_stats,
             "columns":              list(df.columns),
             "masking_applied":      content_type == SecureFile.CONTENT_TYPE_MASKED,
-            "compression":          f"parquet_{parquet_comp}",
+            "compression":          f"ipc_{parquet_comp}",
             "kdf":                  "HKDF-SHA256-v2",
             "encryption":           cipher_str,
-            "integrity":            "HMAC-SHA256",
+            "integrity":            "HMAC-SHA256+MAK",
             "plaintext_size_bytes": plaintext_size,
             "metadata":             metadata or {},
             "expires_at":           expires_at or None,
@@ -1771,9 +2514,16 @@ class SecureFile:
                 f"Use SecureFile.load_open() para arquivos sem criptografia."
             )
 
-        # Verifica HMAC antes de qualquer decifração (Verify-then-Decrypt)
+        # Verifica HMAC antes de qualquer decifração (Verify-then-Decrypt).
+        # Para v2/v3: usa MAK derivada do salt_kdf em posição fixa no cabeçalho,
+        # garantindo separação de domínio completa entre DEK, HEK e MAK.
+        # Para v1: salt_kdf vem depois do header em claro, usa master_key diretamente.
+        salt_kdf_for_hmac: Optional[bytes] = None
+        if file_version in (VERSION_V2, VERSION_V3):
+            salt_kdf_for_hmac = raw[7:7 + SALT_KDF_LEN]  # MAGIC(5)+VERSION(1)+CIPHER(1)
+
         body, file_hmac = raw[:-FILE_HMAC_LEN], raw[-FILE_HMAC_LEN:]
-        if not _verify_file_hmac(master_key_bytes, body, file_hmac):
+        if not _verify_file_hmac(master_key_bytes, body, file_hmac, salt_kdf_for_hmac):
             raise RuntimeError(
                 "Falha de integridade (HMAC inválido). "
                 "Arquivo modificado após criação ou master_key incorreta."
@@ -1839,35 +2589,49 @@ class SecureFile:
 # ---------------------------------------------------------------------------
 
 def _read_source(path: Path) -> pd.DataFrame:
-    """Lê um arquivo de dados de origem para empacotamento."""
-    suffix = path.suffix.lower()
-    readers = {
-        ".csv":     pd.read_csv,
-        ".xlsx":    pd.read_excel,
-        ".xls":     pd.read_excel,
-        ".parquet": pd.read_parquet,
-        ".json":    pd.read_json,
-    }
-    reader = readers.get(suffix)
-    if reader is None:
+    """
+    Lê um arquivo de dados de origem para empacotamento.
+
+    Delega para core.read_file() para aproveitar o suporte completo a
+    formatos (CSV, Parquet, JSON, Excel, ORC, Feather, SAS, SPSS, Stata,
+    HDF5, etc.) sem duplicar a lógica de detecção e fallback.
+
+    Retorna pd.DataFrame para manter compatibilidade com o pipeline de
+    serialização interno (_df_to_bytes / secure_dataframe).
+    """
+    from datalock.core import read_file as _read_file
+    try:
+        df_pl = _read_file(path)
+        return df_pl.to_pandas()
+    except Exception as exc:
         raise ValueError(
-            f"Formato '{suffix}' não suportado para empacotamento. "
-            f"Formatos aceitos: {', '.join(readers)}"
-        )
-    return reader(path)
+            f"Não foi possível ler o arquivo '{path.name}' para empacotamento: {exc}"
+        ) from exc
 
 
 def _decompress_payload(payload: bytes, header: Dict) -> bytes:
     """
     Aplica descompressão ao payload conforme indicado pelo header.
 
-    Suporta retrocompatibilidade com arquivos legados (zlib externo v1.0-v1.2)
-    e o formato atual (compressão interna do Parquet — sem descompressão extra).
+    A compressão nos formatos ipc_* e parquet_* é interna ao serializer
+    (Arrow IPC ou Parquet) — não há camada de compressão externa além do
+    serializer. Esta função só atua em arquivos legados v1.0-v1.2 que
+    usavam zlib externo antes da serialização.
+
+    Valores do campo "compression" por versão:
+      "zlib"         → compressão zlib externa  (v1.0-v1.2, legado)
+      "parquet_zstd" → Parquet/zstd interno     (v1.3, retrocompat)
+      "parquet_lz4"  → Parquet/lz4 interno      (v1.3, retrocompat)
+      "ipc_zstd"     → Arrow IPC/zstd interno   (v1.4+, atual)
+      "ipc_lz4"      → Arrow IPC/lz4 interno    (v1.4+, atual)
+      "ipc_none"     → Arrow IPC sem compressão (v1.4+, atual)
+      "none"         → sem compressão           (v4 sem key)
     """
     compression = header.get("compression", "none")
     if compression == "zlib":
+        # Legado v1.0-v1.2: zlib externo antes do Arrow IPC sem marker
         return zlib.decompress(payload)
-    # "parquet_zstd", "parquet_lz4", "none" — compressão é tratada pelo Parquet
+    # ipc_*, parquet_*, none: compressão interna ao serializer — sem ação extra
     return payload
 
 

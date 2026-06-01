@@ -171,6 +171,40 @@ class TestSecureFileSingle:
         ok, _ = SecureFile.verify(p, master_key="chave-errada-totalmente-diferente")
         assert not ok
 
+    def test_load_raw_no_key_raises_valueerror(self, df_pii, tmpdir_path):
+        """load_raw() sem key deve levantar ValueError com mensagem clara, não AttributeError."""
+        p = str(tmpdir_path / "t.dlk")
+        SecureFile.pack_dataframe(df_pii, p, KEY, overwrite=True)
+        with pytest.raises(ValueError, match="requer master_key"):
+            SecureFile.load_raw(p)
+
+    def test_load_bytes_no_key_raises_valueerror(self, df_pii, tmpdir_path):
+        """load_bytes() sem key deve levantar ValueError."""
+        p = str(tmpdir_path / "t.dlk")
+        SecureFile.pack_dataframe(df_pii, p, KEY, overwrite=True)
+        with pytest.raises(ValueError, match="requer master_key"):
+            SecureFile.load_bytes(p)
+
+
+# ---------------------------------------------------------------------------
+# 3b. SecureFile — multi-frame: key=None
+# ---------------------------------------------------------------------------
+
+class TestSecureFileMultiKeyNone:
+    def test_load_frames_no_key_raises_valueerror(self, df_pii, tmpdir_path):
+        """load_frames() sem key deve levantar ValueError."""
+        p = str(tmpdir_path / "multi.dlk")
+        SecureFile.pack_frames({"a": df_pii}, p, KEY, overwrite=True)
+        with pytest.raises(ValueError, match="requer master_key"):
+            SecureFile.load_frames(p)
+
+    def test_load_frame_no_key_raises_valueerror(self, df_pii, tmpdir_path):
+        """load_frame() sem key deve levantar ValueError."""
+        p = str(tmpdir_path / "multi.dlk")
+        SecureFile.pack_frames({"a": df_pii}, p, KEY, overwrite=True)
+        with pytest.raises(ValueError, match="requer master_key"):
+            SecureFile.load_frame(p, frame="a")
+
 
 # ---------------------------------------------------------------------------
 # 4. SecureFile — multi-frame
@@ -230,6 +264,27 @@ class TestSecureFileOpen:
         ok, info = SecureFile.verify(p)
         assert ok
         assert info["encrypted"] is False
+
+    def test_pack_open_anonymize_false_content_type_is_raw(self, df_pii, tmpdir_path):
+        """pack_open(anonymize=False) deve gravar content_type='raw_dataframe', não 'anon'."""
+        p = str(tmpdir_path / "open_raw.dlk")
+        SecureFile.pack_open(df_pii, p, anonymize=False, overwrite=True)
+        ok, info = SecureFile.verify(p)
+        assert ok
+        assert info["content_type"] == "raw_dataframe", (
+            f"Esperado 'raw_dataframe', obtido '{info['content_type']}'. "
+            "pack_open(anonymize=False) não deve reportar dados como anonimizados."
+        )
+
+    def test_pack_open_anonymize_true_content_type_is_anon(self, df_pii, tmpdir_path):
+        """pack_open(anonymize=True) deve gravar content_type='anon_dataframe'."""
+        p = str(tmpdir_path / "open_anon.dlk")
+        SecureFile.pack_open(df_pii, p, anonymize=True, overwrite=True)
+        ok, info = SecureFile.verify(p)
+        assert ok
+        assert info["content_type"] != "raw_dataframe", (
+            "pack_open(anonymize=True) não deve reportar content_type como raw."
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -395,6 +450,43 @@ class TestConfigure:
         from datalock.adapters import pandas_adapter as _pa
         dd.configure(audit=None)
         assert _pa._GLOBAL_AUDIT is None
+
+    def test_configure_canary_salt_changes_fingerprints(self, df_pii):
+        """canary_salt diferente → fingerprints diferentes para o mesmo pipeline_id."""
+        import datalock.canary as _canary
+
+        dd.configure(canary_salt="salt-canary-teste-A-abcdef0123456789")
+        fp_a = _canary._make_fingerprint("pipeline-teste", 0)
+
+        dd.configure(canary_salt="salt-canary-teste-B-abcdef0123456789")
+        fp_b = _canary._make_fingerprint("pipeline-teste", 0)
+
+        assert fp_a != fp_b, (
+            "Fingerprints com salts diferentes devem divergir — "
+            "se forem iguais, o override de canary_salt não está funcionando."
+        )
+        # reset para não poluir outros testes
+        dd.configure(canary_salt=None)
+
+    def test_configure_canary_salt_none_uses_default(self):
+        """canary_salt=None restaura o comportamento padrão (salt público)."""
+        import datalock.canary as _canary
+
+        dd.configure(canary_salt=None)
+        assert _canary._CANARY_SALT_OVERRIDE is None
+
+    def test_configure_wm_salt_changes_fingerprints(self):
+        """wm_salt diferente → fingerprints de watermark diferentes."""
+        import datalock.canary as _canary
+
+        dd.configure(wm_salt="salt-wm-teste-A-abcdef0123456789")
+        fp_a = _canary._make_wm_fingerprint("corpus-teste", 0)
+
+        dd.configure(wm_salt="salt-wm-teste-B-abcdef0123456789")
+        fp_b = _canary._make_wm_fingerprint("corpus-teste", 0)
+
+        assert fp_a != fp_b
+        dd.configure(wm_salt=None)
 
 
 # ---------------------------------------------------------------------------

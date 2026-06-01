@@ -10,13 +10,13 @@ Leia este arquivo antes de gerar qualquer código que importe `datalock`.
 ## Identidade da biblioteca
 
 ```python
-import datalock as dd   # SEMPRE este alias. Nunca: from logus import *
+import datalock as dd   # SEMPRE este alias. Nunca: from datalock import *
 ```
 
 `datalock` é uma biblioteca Python para:
 1. Manipulação de dados com sintaxe expressiva (próxima de SQL)
 2. Detecção e mascaramento de PII segundo a LGPD brasileira
-3. Armazenamento cifrado no formato `.lgs` (AES-256-GCM)
+3. Armazenamento cifrado no formato `.dlk` (AES-256-GCM)
 4. Leitura de qualquer formato tabular com uma única função
 
 Engine interna: Polars. `dd.col` é `polars.col`. `dd.lit` é `polars.lit`.
@@ -30,20 +30,20 @@ Engine interna: Polars. `dd.col` é `polars.col`. `dd.lit` é `polars.lit`.
 ```python
 # ❌ ERRADO — nunca hardcode salt ou key
 df_safe = dd.mask(df, salt="minha-chave-secreta")
-lg.store(df, "dados.lgs", key="abc123")
+dd.store(df, "dados.dlk", key="abc123")
 
 # ✅ CORRETO — sempre de variáveis de ambiente
 import os
-SALT = os.environ["LOGUS_SALT"]
-KEY  = os.environ["LOGUS_KEY"]
+SALT = os.environ["DATALOCK_SALT"]
+KEY  = os.environ["DATALOCK_KEY"]
 df_safe = dd.mask(df, salt=SALT)
-lg.store(df, "dados.lgs", key=KEY)
+dd.store(df, "dados.dlk", key=KEY)
 ```
 
 Se o usuário não tiver as variáveis, sugira:
 ```bash
-export LOGUS_SALT=$(python -c "import datalock as dd; print(lg.generate_salt())")
-export LOGUS_KEY=$(python -c "import datalock as dd; print(lg.generate_salt())")
+export DATALOCK_SALT=$(python -c "import datalock as dd; print(dd.generate_salt())")
+export DATALOCK_KEY=$(python -c "import datalock as dd; print(dd.generate_salt())")
 ```
 
 ### REGRA 2 — salt e key são DIFERENTES
@@ -51,34 +51,34 @@ export LOGUS_KEY=$(python -c "import datalock as dd; print(lg.generate_salt())")
 ```python
 # ❌ ERRADO — salt e key iguais
 SEGREDO = dd.generate_salt()
-lg.store(df, "dados.lgs", key=SEGREDO, salt=SEGREDO)  # → ValueError
+dd.store(df, "dados.dlk", key=SEGREDO, salt=SEGREDO)  # → ValueError
 
 # ✅ CORRETO — valores distintos com propósitos distintos
-SALT = os.environ["LOGUS_SALT"]  # para mascaramento HMAC
-KEY  = os.environ["LOGUS_KEY"]   # para criptografia AES
+SALT = os.environ["DATALOCK_SALT"]  # para mascaramento HMAC
+KEY  = os.environ["DATALOCK_KEY"]   # para criptografia AES
 ```
 
-### REGRA 3 — Não use open() para .lgs
+### REGRA 3 — Não use open() para .dlk
 
 ```python
 # ❌ ERRADO
-with open("dados.lgs", "rb") as f:
+with open("dados.dlk", "rb") as f:
     data = f.read()
 
 # ✅ CORRETO
-df = dd.read("dados.lgs", key=KEY)
-info = dd.inspect("dados.lgs", key=KEY)  # metadados sem descriptografar
+df   = dd.read("dados.dlk", key=KEY)
+info = dd.inspect("dados.dlk", key=KEY)  # metadados sem descriptografar
 ```
 
 ### REGRA 4 — dd.when() sempre termina com .otherwise()
 
 ```python
 # ❌ ERRADO — colunas sem .otherwise() têm null inesperado
-faixa = dd.when(lg.col("renda") > 10_000, "alta").when(lg.col("renda") > 5_000, "media")
+faixa = dd.when(dd.col("renda") > 10_000, "alta").when(dd.col("renda") > 5_000, "media")
 
 # ✅ CORRETO
-faixa = dd.when(lg.col("renda") > 10_000, "alta") \
-          .when(lg.col("renda") > 5_000,  "media") \
+faixa = dd.when(dd.col("renda") > 10_000, "alta") \
+          .when(dd.col("renda") > 5_000,  "media") \
           .otherwise("baixa")
 ```
 
@@ -89,8 +89,8 @@ faixa = dd.when(lg.col("renda") > 10_000, "alta") \
 df_safe = dd.mask(df)  # hashes mudam entre runs, JOINs quebram
 
 # ✅ CORRETO — configure uma vez no startup
-lg.configure(default_salt=os.environ["LOGUS_SALT"])
-df_safe = dd.mask(df)  # usa LOGUS_SALT automaticamente
+dd.configure(default_salt=os.environ["DATALOCK_SALT"])
+df_safe = dd.mask(df)  # usa DATALOCK_SALT automaticamente
 # OU
 df_safe = dd.mask(df, salt=SALT)  # explícito
 ```
@@ -112,7 +112,7 @@ resultado_pd = dd.mask(df_pd, salt=SALT)  # → pd.DataFrame
 # ✅ PREFERIDO
 from pathlib import Path
 df = dd.read(Path("data") / "clientes.parquet")
-lg.store(df, Path("output") / "clientes.lgs", key=KEY)
+dd.store(df, Path("output") / "clientes.dlk", key=KEY)
 ```
 
 ---
@@ -123,14 +123,14 @@ lg.store(df, Path("output") / "clientes.lgs", key=KEY)
 
 ```python
 # dd.read() detecta formato pela extensão e encoding automaticamente
-df = dd.read("clientes.csv")           # pl.DataFrame
-df = dd.read("clientes.xlsx")          # pl.DataFrame (requer [excel])
-df = dd.read("clientes.parquet")       # pl.DataFrame
-df = dd.read("clientes.lgs", key=KEY)  # pl.DataFrame (descriptografa)
+df = dd.read("clientes.csv")            # pl.DataFrame
+df = dd.read("clientes.xlsx")           # pl.DataFrame (requer [excel])
+df = dd.read("clientes.parquet")        # pl.DataFrame
+df = dd.read("clientes.dlk", key=KEY)   # pl.DataFrame (descriptografa)
 
 # Com mascaramento automático
 df = dd.read("clientes.csv", salt=SALT)
-df = dd.read("clientes.lgs", key=KEY, salt=SALT)
+df = dd.read("clientes.dlk", key=KEY, salt=SALT)
 
 # Big data — sem carregar tudo na memória
 df   = dd.read("big.parquet", head=100_000)
@@ -144,8 +144,8 @@ for chunk in dd.read("big.parquet", n_chunks=10, iter_chunks=True):
 ### Mascaramento
 
 ```python
-SALT = os.environ["LOGUS_SALT"]
-KEY  = os.environ["LOGUS_KEY"]
+SALT = os.environ["DATALOCK_SALT"]
+KEY  = os.environ["DATALOCK_KEY"]
 
 # Detecta PII primeiro (opcional — mask() faz internamente)
 reports = dd.scan(df)
@@ -158,22 +158,22 @@ diff = dd.diff(df, df_safe)
 print(diff["summary"])
 
 # Salva cifrado
-lg.store(df_safe, "clientes.lgs", key=KEY)
+dd.store(df_safe, "clientes.dlk", key=KEY)
 ```
 
 ### Manipulação
 
 ```python
 # Filtragem
-df_sp = dd.where(df, uf="SP")
+df_sp    = dd.where(df, uf="SP")
 df_ricos = dd.where(df, renda=(">", 10_000))
 df_combo = dd.where(df, uf=["SP","RJ"], renda=(5_000, 50_000))
 
 # Novas colunas
 df = dd.add_column(df,
     imposto = dd.col("renda") * 0.275,
-    faixa   = dd.when(lg.col("renda") > 10_000, "alta")
-                .when(lg.col("renda") > 5_000, "media")
+    faixa   = dd.when(dd.col("renda") > 10_000, "alta")
+                .when(dd.col("renda") > 5_000, "media")
                 .otherwise("baixa"),
 )
 
@@ -191,7 +191,7 @@ resultado = dd.groupby(df, "uf", {
 result = (
     dd.pipe("clientes.parquet")
     .where(uf="SP")
-    .add_column(imposto=lg.col("renda") * 0.275)
+    .add_column(imposto=dd.col("renda") * 0.275)
     .mask(salt=SALT)
     .collect()
 )
@@ -201,7 +201,7 @@ result = dd.process(
     "clientes.parquet",
     salt=SALT,
     key=KEY,
-    output="clientes_safe.lgs",
+    output="clientes_safe.dlk",
     where={"uf": "SP"},
     rules={"cpf": {"not_null": True}},
 )
@@ -212,7 +212,7 @@ result = dd.process(
 ## Arquitetura de módulos
 
 ```
-logus/
+datalock/
 ├── __init__.py       # API pública: dd.read, dd.mask, dd.scan, dd.store, dd.where...
 ├── core.py           # Motor: read_file(), mask_frame(), mask_lazyframe()
 ├── analytics.py      # DSL: where, groupby, sort, add_column, when, pivot...
@@ -222,8 +222,8 @@ logus/
 ├── lineage.py        # Linhagem: LineageTracker, session()
 ├── privacy_score.py  # Score LGPD: calculate(), PrivacyScore
 ├── sql_transpiler.py # SQL: mask_sql(), generate_view()
-├── secure_file.py    # Formato .lgs: SecureFile (AES-256-GCM)
-├── lgs.py            # OO wrapper: LGSFile, context manager
+├── secure_file.py    # Formato .dlk: SecureFile (AES-256-GCM)
+├── dlk.py            # OO wrapper: DLKFile, context manager
 ├── check.py          # Métricas: kanon, risk, utility, dp, tcloseness
 ├── link.py           # DB: dd.db(), SecureDBAdapter, SQLAdapter
 ├── detectors/
@@ -272,7 +272,7 @@ logus/
 | Ler tabela de banco de dados | `dd.db() + dd.read(banco, tabela)` |
 | Detectar PII em DataFrame | `dd.scan(df)` |
 | Mascarar PII para análise | `dd.mask(df, salt=SALT)` |
-| Mascarar e salvar cifrado | `dd.store(df, "f.lgs", key=KEY, salt=SALT)` |
+| Mascarar e salvar cifrado | `dd.store(df, "f.dlk", key=KEY, salt=SALT)` |
 | Pipeline lê+transforma+mascara+salva | `dd.process()` ou `dd.pipe()` |
 | Validar qualidade dos dados | `dd.validate(df, rules)` |
 | Diagnóstico rápido LGPD | `dd.profile(df)` |
@@ -290,12 +290,12 @@ logus/
 
 ### ImportError: No module named 'duckdb'
 ```bash
-pip install 'logus-lgpd[sql]'
+pip install 'datalock[sql]'
 ```
 
 ### ImportError: No module named 'openpyxl'
 ```bash
-pip install 'logus-lgpd[excel]'
+pip install 'datalock[excel]'
 ```
 
 ### ValueError: key= e salt= não devem ser iguais
@@ -315,14 +315,14 @@ df_safe = dd.mask(df_already_masked, salt=SALT, strict=False)
 ### UserWarning: dd.mask(salt=None) salt aleatório
 ```python
 # Configure o salt padrão no startup da aplicação
-lg.configure(default_salt=os.environ["LOGUS_SALT"])
+dd.configure(default_salt=os.environ["DATALOCK_SALT"])
 ```
 
 ### FileNotFoundError ao dd.read()
 ```python
 from pathlib import Path
 # Verifique se o arquivo existe antes de ler
-p = Path("clientes.lgs")
+p = Path("clientes.dlk")
 if not p.exists():
     raise FileNotFoundError(f"Arquivo não encontrado: {p}")
 df = dd.read(p, key=KEY)
@@ -349,7 +349,7 @@ df    = dd.read(banco, "clientes")
 df    = dd.read(banco, "SELECT * FROM clientes WHERE uf='SP'")
 df    = dd.read(banco, "clientes", sample=10_000)
 banco.write(df_safe, "clientes_masked")
-lg.write(df_safe, banco, "clientes_masked")
+dd.write(df_safe, banco, "clientes_masked")
 ```
 
 ## mask(LazyFrame) (v1.0.5)
@@ -361,7 +361,7 @@ result  = lf_safe.collect()
 
 ---
 
-## v1.1.1 new features
+## v1.1.0 new features
 
 ### dd.contract() — Data Contract (unified validation + PII + masking)
 ```python
@@ -394,24 +394,24 @@ reports = dd.scan(df, custom_patterns={
 ### Asymmetric encryption (EC P-256 or RSA)
 ```python
 priv, pub = dd.generate_keypair("ec")    # or "rsa"
-lg.save_keypair(priv,"priv.pem", pub,"pub.pem")
+dd.save_keypair(priv, "priv.pem", pub, "pub.pem")
 priv = dd.load_private_key("priv.pem")
 pub  = dd.load_public_key("pub.pem")
 
-lg.store(df, "dados.lgs", public_key=pub)     # encrypt for recipient
-df  = dd.read("dados.lgs", private_key=priv)  # recipient decrypts
+dd.store(df, "dados.dlk", public_key=pub)     # encrypt for recipient
+df  = dd.read("dados.dlk", private_key=priv)  # recipient decrypts
 ```
 
 ### File expiration
 ```python
-lg.store(df,"dados.lgs",key=KEY,expires_at="2025-12-31")
+dd.store(df, "dados.dlk", key=KEY, expires_at="2025-12-31")
 # ExpiredFileError raised after that date
 ```
 
 ### Schema validation + rule persistence
 ```python
-lg.validate_schema(df, required_columns=["cpf","renda"], min_rows=1).raise_if_failed()
-lg.save_rules({"cpf":{"not_null":True}}, "rules.json")
+dd.validate_schema(df, required_columns=["cpf","renda"], min_rows=1).raise_if_failed()
+dd.save_rules({"cpf":{"not_null":True}}, "rules.json")
 rules = dd.load_rules("rules.json")
 ```
 
@@ -424,17 +424,25 @@ report.to_text()              # always available
 
 ### Time-series + nested data
 ```python
-lg.shift(df, 1)                     # previous value (lag)
-lg.lead(df, 1)                      # next value
-lg.lag(df, 3, columns="renda")      # alias for shift(3)
-lg.explode(df, "tags")              # list column → multiple rows
+dd.shift(df, 1)                     # previous value (lag)
+dd.lead(df, 1)                      # next value
+dd.lag(df, 3, columns="renda")      # alias for shift(3)
+dd.explode(df, "tags")              # list column → multiple rows
 ```
 
 ### .env + create_table + upsert
 ```python
-lg.configure(load_dotenv=True)                          # reads .env
+dd.configure(load_dotenv=True)                          # reads .env
 banco.create_table(df, "t", if_exists="replace")        # DDL from DataFrame
 banco.upsert(df_new, "clientes", on="cpf")              # upsert
+```
+
+### Canary salt configurável (v1.1.0)
+```python
+# Para ambientes de produção — impede pré-cálculo de fingerprints por adversários
+dd.configure(canary_salt=os.environ["DATALOCK_CANARY_SALT"])
+# Ou via .env com load_dotenv=True (lê DATALOCK_CANARY_SALT automaticamente)
+dd.configure(load_dotenv=True)
 ```
 
 ---

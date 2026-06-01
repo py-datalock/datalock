@@ -733,7 +733,7 @@ See [CHANGELOG.md](CHANGELOG.md).
 
 ---
 
-## Novidades v1.1.1
+## Novidades v1.1.0
 
 ### 1. `lg.contract()` — Contrato de Dados
 

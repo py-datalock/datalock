@@ -31,8 +31,8 @@ import datalock as dd
 from datalock.detectors.fast_scan import FastPIIScanner
 from datalock.detectors.pii_detector import PIIDetector
 
-SALT = "salt-teste-logus-v105-abcdef"
-KEY  = "key-teste-logus-v105-ghijkl"
+SALT = "salt-teste-datalock-v105-abcdef"
+KEY  = "key-teste-datalock-v105-ghijkl"
 
 
 # ---------------------------------------------------------------------------
@@ -825,43 +825,45 @@ class TestProcess:
 # 13. Backward compatibility — existing API still works
 # ---------------------------------------------------------------------------
 
-class TestBackwardCompat:
-    def test_lg_read_csv(self, csv_file):
+class TestAPIHighLevel:
+    """Testes de fumaça da API pública dd.* — cobre os caminhos mais comuns."""
+
+    def test_dd_read_csv(self, csv_file):
         df = dd.read(str(csv_file))
         assert isinstance(df, pl.DataFrame)
 
-    def test_lg_read_parquet(self, parquet_file):
+    def test_dd_read_parquet(self, parquet_file):
         df = dd.read(str(parquet_file))
         assert isinstance(df, pl.DataFrame)
 
-    def test_lg_mask_polars(self, df_pii):
+    def test_dd_mask_polars(self, df_pii):
         result = dd.mask(df_pii, salt=SALT)
         assert isinstance(result, pl.DataFrame)
         assert result["cpf"][0] != df_pii["cpf"][0]
 
-    def test_lg_mask_pandas(self, df_pii_pd):
+    def test_dd_mask_pandas(self, df_pii_pd):
         result = dd.mask(df_pii_pd, salt=SALT)
         assert isinstance(result, pd.DataFrame)
 
-    def test_lg_scan(self, df_pii):
+    def test_dd_scan(self, df_pii):
         reports = dd.scan(df_pii)
         assert "cpf" in reports
 
-    def test_lg_store_read_lgs(self, tmp_path, df_pii):
+    def test_dd_store_read_dlk(self, tmp_path, df_pii):
         p = tmp_path / "test.dlk"
         dd.store(df_pii.to_pandas(), str(p), key=KEY, overwrite=True)
         df_back = dd.read(str(p), key=KEY)
         assert df_back.shape == df_pii.shape
 
-    def test_lg_where(self, df_pii):
+    def test_dd_where(self, df_pii):
         result = dd.where(df_pii, uf="SP")
         assert all(result["uf"] == "SP")
 
-    def test_lg_groupby(self, df_pii):
+    def test_dd_groupby(self, df_pii):
         result = dd.groupby(df_pii, "uf", {"n": ("*", "count")})
         assert "n" in result.columns
 
-    def test_lg_pipe(self, df_pii):
+    def test_dd_pipe(self, df_pii):
         result = (
             dd.pipe(df_pii)
             .where(uf="SP")
@@ -869,12 +871,12 @@ class TestBackwardCompat:
         )
         assert isinstance(result, pl.DataFrame)
 
-    def test_lg_diff(self, df_pii):
+    def test_dd_diff(self, df_pii):
         df_safe = dd.mask(df_pii, salt=SALT)
         report = dd.diff(df_pii.to_pandas(), df_safe.to_pandas())
         assert len(report["columns_changed"]) > 0
 
-    def test_lg_join_safe(self, df_pii):
+    def test_dd_join_safe(self, df_pii):
         df_p = pl.DataFrame({
             "cpf":   df_pii["cpf"].to_list(),
             "valor": [100.0] * len(df_pii),

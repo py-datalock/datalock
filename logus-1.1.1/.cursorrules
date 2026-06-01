@@ -48,7 +48,7 @@ processor.py → process(), ProcessResult
 secure_file.py → .lgs format (AES-256-GCM)
 detectors/fast_scan.py → FastPIIScanner (default, 9× faster)
 
-## v1.1.1 additions
+## v1.1.0 additions
 contract:      `contrato = lg.contract({"cpf":{"pii":"CPF","mask":"hash","not_null":True}})`
 apply:         `result = contrato.apply(df, salt=SALT); result.raise_if_failed()`
 asymmetric:    `priv,pub = lg.generate_keypair("ec"); lg.store(df,"f.lgs",public_key=pub)`
