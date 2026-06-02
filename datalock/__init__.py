@@ -19,7 +19,7 @@ Uso rápido:
 """
 from __future__ import annotations
 
-__version__ = "1.1.1"
+__version__ = "1.1.2"
 
 # Backward compat: "import logus as lg" still works
 from datalock._logus_compat import *  # noqa: F401, F403
@@ -170,7 +170,7 @@ __all__ = [
     "to_pandas", "to_polars",
     # Pipeline e SQL
     "pipe", "sql",
-    # v1.1.1 (datalock) — canary, scan_directory, synthetic, audit webhook
+    # v1.1.2 (datalock) — canary, scan_directory, synthetic, audit webhook
     'view', 'canary_check', 'canary_info', 'scan_directory', 'DirectoryInventory', 'SyntheticGenerator',
     # v1.1.0 — 10 new features
     'contract', 'DataContract', 'FieldSpec', 'ContractDiff',

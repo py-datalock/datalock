@@ -200,7 +200,7 @@ dd.configure(audit_webhook="https://hooks.slack.com/...")
 ## The `.dlk` format
 
 Binary container: AES-256-GCM + HKDF-SHA256 + Parquet/zstd.
-Magic bytes: `b"DLOCK"` (v1.1.1+). Prior `b"LOGUS"` files still readable.
+Magic bytes: `b"DLOCK"` (v1.1.2+). Prior `b"LOGUS"` files still readable.
 
 ```python
 info = dd.inspect("clientes.dlk", key=KEY)

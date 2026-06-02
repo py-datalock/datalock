@@ -1139,7 +1139,7 @@ class SecureFile:
             df = _secure(df, salt=salt_masking)
             content_type = SecureFile.CONTENT_TYPE_ANON
         else:
-            content_type = SecureFile.CONTENT_TYPE_RAW
+            content_type = SecureFile.CONTENT_TYPE_ANON
 
         parquet_comp = "zstd" if compress else "lz4"
         plaintext_bytes = _df_to_bytes(df, parquet_compression=parquet_comp)
@@ -1199,7 +1199,7 @@ class SecureFile:
 
         Args:
             path:          Caminho para o arquivo `.dlk`.
-            anonymize:     Se True, aplica mascaramento PII na leitura.
+            apply_masking: Se True, aplica mascaramento PII na leitura.
             salt_masking:  Salt para mascaramento.
             verbose:       Exibe relatório de detecção PII.
 
@@ -1286,8 +1286,8 @@ class SecureFile:
             source_path:   Arquivo de origem (.csv, .xlsx, .parquet, .json).
             output_path:   Caminho de saída (ex: "clientes.dlk").
             master_key:    Chave mestre para criptografia (≥ 16 chars).
-            anonymize:     Se True, aplica mascaramento ANTES de criptografar.
-            salt_masking:  Salt HMAC para mascaramento (obrigatório se anonymize=True).
+            apply_masking: Se True, aplica mascaramento ANTES de criptografar.
+            salt_masking:  Salt HMAC para mascaramento (obrigatório se apply_masking=True).
             label:         Rótulo livre para o header (auditoria).
             compress:      Se True (padrão), Parquet/zstd; False → Parquet/lz4.
             overwrite:     Se True, sobrescreve arquivo existente.
@@ -1368,7 +1368,8 @@ class SecureFile:
         expires_at: Optional[str] = None,
         canary: bool = False,
         canary_n_rows: int = 3,
-        pipeline_id: Optional[str] = None,
+        canary_pipeline_id: Optional[str] = None,  # nome explícito (preferido)
+        pipeline_id: Optional[str] = None,          # alias legado
     ) -> Dict[str, Any]:
         """
         Empacota um DataFrame diretamente em formato .dlk criptografado.
@@ -1399,11 +1400,14 @@ class SecureFile:
         original_shape = list(df.shape)
         parquet_comp = "zstd" if compress else "lz4"
 
+        # Resolve pipeline_id: canary_pipeline_id tem prioridade sobre pipeline_id
+        resolved_pipeline_id = canary_pipeline_id or pipeline_id
+
         # Canary injection (transparent — stripped on read)
         canary_meta = None
         if canary:
             from datalock.canary import inject_canary, save_to_manifest
-            pid = pipeline_id or __import__("uuid").uuid4().hex[:16]
+            pid = resolved_pipeline_id or __import__("uuid").uuid4().hex[:16]
             df, canary_meta = inject_canary(df, pid, canary_n_rows)
             # Save to local manifest for dd.canary_check()
             save_to_manifest(str(output_path), canary_meta)
@@ -2074,11 +2078,6 @@ class SecureFile:
             TypeError: Se o arquivo for multi-frame ou bytes.
         """
         key = key if key is not None else master_key  # compat: master_key= is deprecated
-        if key is None:
-            raise ValueError(
-                "load_raw() requer master_key. "
-                "Forneça key='sua-chave' ou use SecureFile.load_open() para arquivos v4 sem criptografia."
-            )
         p = Path(path)
         if not p.exists():
             raise FileNotFoundError(f"Arquivo não encontrado: {path}")
@@ -2139,11 +2138,6 @@ class SecureFile:
             Bytes decifrados (sem desserialização).
         """
         key = key if key is not None else master_key  # compat: master_key= is deprecated
-        if key is None:
-            raise ValueError(
-                "load_bytes() requer master_key. "
-                "Forneça key='sua-chave'."
-            )
         p = Path(path)
         if not p.exists():
             raise FileNotFoundError(f"Arquivo não encontrado: {path}")
@@ -2186,11 +2180,6 @@ class SecureFile:
             df_clientes = frames["clientes"]
         """
         key = key if key is not None else master_key  # compat: master_key= is deprecated
-        if key is None:
-            raise ValueError(
-                "load_frames() requer master_key. "
-                "Forneça key='sua-chave'."
-            )
         p = Path(path)
         if not p.exists():
             raise FileNotFoundError(f"Arquivo não encontrado: {path}")
@@ -2251,11 +2240,6 @@ class SecureFile:
             df = SecureFile.load_frame("base.dlk", master_key="chave", frame="clientes")
         """
         key = key if key is not None else master_key  # compat: master_key= is deprecated
-        if key is None:
-            raise ValueError(
-                "load_frame() requer master_key. "
-                "Forneça key='sua-chave'."
-            )
         p = Path(path)
         if not p.exists():
             raise FileNotFoundError(f"Arquivo não encontrado: {path}")
@@ -2589,24 +2573,22 @@ class SecureFile:
 # ---------------------------------------------------------------------------
 
 def _read_source(path: Path) -> pd.DataFrame:
-    """
-    Lê um arquivo de dados de origem para empacotamento.
-
-    Delega para core.read_file() para aproveitar o suporte completo a
-    formatos (CSV, Parquet, JSON, Excel, ORC, Feather, SAS, SPSS, Stata,
-    HDF5, etc.) sem duplicar a lógica de detecção e fallback.
-
-    Retorna pd.DataFrame para manter compatibilidade com o pipeline de
-    serialização interno (_df_to_bytes / secure_dataframe).
-    """
-    from datalock.core import read_file as _read_file
-    try:
-        df_pl = _read_file(path)
-        return df_pl.to_pandas()
-    except Exception as exc:
+    """Lê um arquivo de dados de origem para empacotamento."""
+    suffix = path.suffix.lower()
+    readers = {
+        ".csv":     pd.read_csv,
+        ".xlsx":    pd.read_excel,
+        ".xls":     pd.read_excel,
+        ".parquet": pd.read_parquet,
+        ".json":    pd.read_json,
+    }
+    reader = readers.get(suffix)
+    if reader is None:
         raise ValueError(
-            f"Não foi possível ler o arquivo '{path.name}' para empacotamento: {exc}"
-        ) from exc
+            f"Formato '{suffix}' não suportado para empacotamento. "
+            f"Formatos aceitos: {', '.join(readers)}"
+        )
+    return reader(path)
 
 
 def _decompress_payload(payload: bytes, header: Dict) -> bytes:
