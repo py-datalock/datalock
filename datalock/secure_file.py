@@ -127,6 +127,13 @@ import pandas as pd
 
 from datalock.adapters.pandas_adapter import secure_dataframe
 from datalock.utils.secret_str import SecretStr
+from datalock.ipc_index import (
+    compute_batch_stats,
+    prune_row_groups,
+    apply_arrow_filters,
+    normalize_filters,
+    ALL_BATCHES_SENTINEL,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -245,36 +252,46 @@ def _require_cryptography() -> Any:
 # Serialização interna do DataFrame — Parquet via PyArrow
 # ---------------------------------------------------------------------------
 
-def _df_to_bytes(df, parquet_compression: str = "zstd") -> bytes:
+def _df_to_bytes(
+    df,
+    parquet_compression: str = "zstd",
+    row_group_size: int = 50_000,
+    content_type: str = "raw_dataframe",
+) -> Tuple[bytes, List[Dict]]:
     """
-    Serializa DataFrame para bytes via Arrow IPC em memória.
+    Serializa DataFrame para bytes via Arrow IPC em múltiplos record batches.
 
-    Arrow IPC (Apache Arrow Inter-Process Communication format) é um formato
-    de serialização binária colunar que mapeia diretamente o layout in-memory
-    do Apache Arrow sem overhead de estrutura analítica (row groups, column
-    chunks, footer de predicados). Isso o torna 3-5× mais rápido que Parquet
-    para serialização em memória — contexto exato do .dlk, onde os dados são
-    imediatamente cifrados e o acesso por predicado (pushdown) é irrelevante.
+    v1.2.0: serializa como stream de N record batches com estatísticas por
+    batch, permitindo column pruning e predicate pushdown na leitura sem
+    decifrar/alocar dados desnecessários.
 
-    O argumento parquet_compression é mantido com o mesmo nome por
-    retrocompatibilidade de chamadas existentes — seu valor é mapeado para o
-    equivalente Arrow IPC. O campo 'compression' no cabeçalho do arquivo
-    passa a ser "ipc_zstd", "ipc_lz4" ou "ipc_none" para distinguir de
-    arquivos legados com compressão Parquet interna.
+    Retorna TUPLA (bytes, list[dict]) onde list[dict] são os metadados de
+    cada batch: {batch_index, byte_offset, byte_length, n_rows, stats}.
+
+    Retrocompatibilidade — callers existentes que faziam:
+        payload = _df_to_bytes(df)
+    devem ser atualizados para:
+        payload, row_groups_meta = _df_to_bytes(df, content_type=content_type)
 
     Magic markers por formato:
       b'IPC1\x00' → Arrow IPC (datalock >= v1.4) ← formato atual
       b'PQ1\x00'  → Parquet  (datalock v1.3)      ← leitura retrocompat
       (sem marker) → Arrow IPC legado (datalock v1.0-v1.2) ← leitura retrocompat
 
-    Compressões suportadas (mapeadas de parquet_compression):
+    Compressões suportadas:
       "zstd" → IPC/zstd  — melhor razão tamanho/velocidade (padrão)
-      "lz4"  → IPC/lz4   — máxima velocidade, +2x tamanho vs zstd
-      "none" → IPC sem compressão — máxima velocidade, maior tamanho
+      "lz4"  → IPC/lz4   — máxima velocidade
+      "none" → IPC sem compressão
 
     Args:
         df:                  pd.DataFrame ou pl.DataFrame.
         parquet_compression: "zstd" | "lz4" | "none" (alias mantido por compat).
+        row_group_size:      Linhas por record batch (padrão 50 000).
+        content_type:        "raw_dataframe" | "masked_dataframe" | outros.
+                             Controla quais stats são incluídas nos metadados.
+
+    Returns:
+        Tuple (bytes, list[dict])
 
     Referências:
         Apache Arrow IPC Format Specification
@@ -283,15 +300,11 @@ def _df_to_bytes(df, parquet_compression: str = "zstd") -> bytes:
     import pyarrow as pa
     import pyarrow.ipc as ipc
 
-    # Normaliza o parâmetro de compressão para o vocabulário Arrow IPC.
-    # Arrow IPC suporta "zstd" e "lz4" nativamente via IpcWriteOptions.
-    # "snappy" não é suportado por Arrow IPC — mapeia para "lz4" como
-    # alternativa de performance similar.
     _COMPRESSION_MAP = {
-        "zstd":   "zstd",
-        "lz4":    "lz4",
-        "snappy": "lz4",   # snappy → lz4 (não suportado por Arrow IPC)
-        "none":   None,
+        "zstd":         "zstd",
+        "lz4":          "lz4",
+        "snappy":       "lz4",   # snappy → lz4 (não suportado por Arrow IPC)
+        "none":         None,
         "uncompressed": None,
     }
     arrow_compression = _COMPRESSION_MAP.get(parquet_compression, "zstd")
@@ -306,51 +319,157 @@ def _df_to_bytes(df, parquet_compression: str = "zstd") -> bytes:
 
     buf = io.BytesIO()
     opts = ipc.IpcWriteOptions(compression=arrow_compression)
+    row_groups_meta: List[Dict] = []
+
     with ipc.new_stream(buf, table.schema, options=opts) as writer:
-        writer.write_table(table, max_chunksize=None)
+        batches = table.to_batches(max_chunksize=row_group_size)
+        for batch_index, batch in enumerate(batches):
+            byte_offset = buf.tell()
+            writer.write_batch(batch)
+            byte_length = buf.tell() - byte_offset
 
-    return b"IPC1\x00" + buf.getvalue()
+            stats = compute_batch_stats(batch, content_type=content_type)
+            row_groups_meta.append({
+                "batch_index":  batch_index,
+                "byte_offset":  byte_offset,
+                "byte_length":  byte_length,
+                "n_rows":       batch.num_rows,
+                "stats":        stats,
+            })
+
+    return b"IPC1\x00" + buf.getvalue(), row_groups_meta
 
 
-def _bytes_to_df(data: bytes) -> pd.DataFrame:
+def _bytes_to_df(
+    data: bytes,
+    columns: Optional[List[str]] = None,
+    filters: Optional[Dict] = None,
+    row_groups_meta: Optional[List[Dict]] = None,
+) -> pd.DataFrame:
     """
     Desserializa bytes para DataFrame com detecção automática de formato.
 
+    v1.2.0: aceita columns=, filters= e row_groups_meta= para column pruning
+    e predicate pushdown no nível Arrow, antes de alocar memória para os dados.
+
     Detecta o formato pelo magic marker nos primeiros 5 bytes:
 
-      b'IPC1\\x00' → Arrow IPC (datalock >= v1.4)   ← formato atual
-      b'PQ1\\x00'  → Parquet  (datalock v1.3)        ← retrocompat
+      b'IPC1\x00' → Arrow IPC (datalock >= v1.4)   ← formato atual
+      b'PQ1\x00'  → Parquet  (datalock v1.3)        ← retrocompat
       outros      → Arrow IPC sem marker (datalock v1.0-v1.2) ← retrocompat legado
 
-    Retrocompatibilidade total: arquivos gerados por qualquer versão do
-    datalock são lidos corretamente, sem flag de versão adicional — o magic
-    marker é suficiente para discriminar os três casos.
+    Retrocompatibilidade:
+      row_groups_meta=[] ou None → sem pruning, lê tudo (comportamento anterior).
+      columns=None, filters=None → comportamento idêntico ao anterior.
 
-    Retorna sempre pd.DataFrame para consistência com o restante do SecureFile.
+    Args:
+        data:             Bytes serializados (com magic marker).
+        columns:          Lista de colunas a retornar. None = todas.
+        filters:          Dict de filtros no formato dd.read(filters=...).
+                          None = sem filtragem de linhas.
+        row_groups_meta:  Metadados de row groups do header (para pruning).
+                          None ou [] = sem pruning (lê todos os batches).
     """
     import pyarrow as pa
     import pyarrow.ipc as ipc
 
     marker = data[:5]
 
-    if marker == b"IPC1\x00":
-        # Arrow IPC — formato atual (datalock >= v1.4)
-        reader = ipc.open_stream(io.BytesIO(data[5:]))
-        return reader.read_pandas()
-
-    elif marker[:4] == b"PQ1\x00":
+    # Arquivos legados (retrocompat) — sem row group pruning
+    if marker[:4] == b"PQ1\x00":
         # Parquet — datalock v1.3 (retrocompat)
         try:
             import polars as _pl
-            return _pl.read_parquet(io.BytesIO(data[4:])).to_pandas()
+            df = _pl.read_parquet(io.BytesIO(data[4:])).to_pandas()
         except Exception:
             import pyarrow.parquet as pq
-            return pq.read_table(io.BytesIO(data[4:])).to_pandas()
+            df = pq.read_table(io.BytesIO(data[4:])).to_pandas()
+        # Aplica column pruning e filtros em pandas (retrocompat — sem stats)
+        if columns:
+            existing = [c for c in columns if c in df.columns]
+            if existing:
+                df = df[existing]
+        if filters:
+            df = _apply_pandas_filters(df, filters)
+        return df
 
-    else:
-        # Arrow IPC sem marker — datalock v1.0-v1.2 (retrocompat legado)
-        reader = ipc.open_stream(io.BytesIO(data))
-        return reader.read_pandas()
+    # Arrow IPC — formato atual e legado sem marker
+    ipc_data = data[5:] if marker == b"IPC1\x00" else data
+    reader = ipc.open_stream(io.BytesIO(ipc_data))
+
+    # Determina batches relevantes via row group pruning
+    relevant_batches = prune_row_groups(row_groups_meta, filters)
+    use_pruning = relevant_batches != {ALL_BATCHES_SENTINEL}
+
+    batches = []
+    n_batches = reader.num_record_batches
+
+    for i in range(n_batches):
+        batch = reader.get_batch(i)
+
+        # Row group pruning: pula batches irrelevantes
+        if use_pruning and i not in relevant_batches:
+            continue  # lê e descarta sem construir arrays python
+
+        # Column pruning: seleciona apenas as colunas necessárias
+        if columns:
+            available = [c for c in columns if c in batch.schema.names]
+            if available:
+                batch = batch.select(available)
+            else:
+                continue  # nenhuma das colunas pedidas existe neste batch
+
+        # Predicate pushdown: filtra linhas no nível Arrow
+        if filters:
+            batch = apply_arrow_filters(batch, filters)
+            if batch.num_rows == 0:
+                continue  # batch vazio após filtro — não materializa
+
+        batches.append(batch)
+
+    if not batches:
+        # Nenhum batch passou os filtros — retorna DataFrame vazio com schema correto
+        schema = reader.schema_arrow
+        if columns:
+            available = [c for c in columns if c in schema.names]
+            if available:
+                schema = schema.select(available)
+        empty_table = pa.table({f.name: pa.array([], type=f.type) for f in schema})
+        return empty_table.to_pandas()
+
+    table = pa.Table.from_batches(batches)
+    return table.to_pandas()
+
+
+def _apply_pandas_filters(df: pd.DataFrame, filters: Dict) -> pd.DataFrame:
+    """
+    Aplica filtros em DataFrame pandas (fallback para arquivos legados sem Arrow IPC).
+    """
+    normalized = normalize_filters(filters)
+    mask = pd.Series([True] * len(df), index=df.index)
+
+    for col, op, value in normalized:
+        if col not in df.columns:
+            continue
+        s = df[col]
+        if op == "==":
+            mask &= s == value
+        elif op == "!=":
+            mask &= s != value
+        elif op == ">":
+            mask &= s > value
+        elif op == ">=":
+            mask &= s >= value
+        elif op == "<":
+            mask &= s < value
+        elif op == "<=":
+            mask &= s <= value
+        elif op == "in":
+            mask &= s.isin(value)
+        elif op == "range":
+            mask &= (s >= value[0]) & (s <= value[1])
+
+    return df[mask].reset_index(drop=True)
 
 
 # ---------------------------------------------------------------------------
@@ -384,7 +503,7 @@ def _frames_to_zip_bytes(
 
     with zipfile.ZipFile(buf, mode="w", compression=zipfile.ZIP_STORED) as zf:
         for name, df in frames.items():
-            parquet_bytes = _df_to_bytes(df, parquet_compression=parquet_compression)
+            parquet_bytes, _rg = _df_to_bytes(df, parquet_compression=parquet_compression)
             filename = f"{name}.parquet"
             zf.writestr(filename, parquet_bytes)
             index.append({
@@ -485,7 +604,7 @@ def _frames_to_acl_zip_bytes(
             level = frame_access_levels.get(name, "internal")
             frame_dek = _derive_frame_dek(master_key_bytes, salt_kdf, level)
 
-            parquet_bytes = _df_to_bytes(df, parquet_compression=parquet_compression)
+            parquet_bytes, _rg = _df_to_bytes(df, parquet_compression=parquet_compression)
             nonce = os.urandom(NONCE_LEN)
             ct, tag = _encrypt(frame_dek, nonce, parquet_bytes, cipher_str)
 
@@ -1225,7 +1344,10 @@ class SecureFile:
             content_type = SecureFile.CONTENT_TYPE_ANON
 
         parquet_comp = "zstd" if compress else "lz4"
-        plaintext_bytes = _df_to_bytes(df, parquet_compression=parquet_comp)
+        plaintext_bytes, _rg_meta = _df_to_bytes(
+            df, parquet_compression=parquet_comp,
+            content_type=content_type,
+        )
 
         header = {
             "format":               "lgs",
@@ -1410,7 +1532,10 @@ class SecureFile:
             else SecureFile.CONTENT_TYPE_RAW
         )
         parquet_comp = "zstd" if compress else "lz4"
-        plaintext_bytes = _df_to_bytes(df, parquet_compression=parquet_comp)
+        plaintext_bytes, row_groups_meta = _df_to_bytes(
+            df, parquet_compression=parquet_comp,
+            content_type=content_type,
+        )
 
         header = cls._build_header(
             content_type=content_type,
@@ -1421,6 +1546,7 @@ class SecureFile:
             plaintext_size=len(plaintext_bytes),
             metadata=metadata,
             expires_at=expires_at,
+            row_groups_meta=row_groups_meta,
         )
 
         body, salt_kdf = _pack_v2_body(master_key_bytes, header, plaintext_bytes, _get_best_cipher(), compress)
@@ -1501,7 +1627,10 @@ class SecureFile:
             # Save to local manifest for dd.canary_check()
             save_to_manifest(str(output_path), canary_meta)
 
-        plaintext_bytes = _df_to_bytes(df, parquet_compression=parquet_comp)
+        plaintext_bytes, row_groups_meta = _df_to_bytes(
+            df, parquet_compression=parquet_comp,
+            content_type=content_type,
+        )
 
         # Merge canary metadata into header so load() can strip rows
         merged_meta = dict(metadata or {})
@@ -1518,6 +1647,7 @@ class SecureFile:
             plaintext_size=len(plaintext_bytes),
             metadata=merged_meta if merged_meta else metadata,
             expires_at=expires_at,
+            row_groups_meta=row_groups_meta,
         )
 
         body, salt_kdf = _pack_v2_body(master_key_bytes, header, plaintext_bytes, _get_best_cipher(), compress)
@@ -2061,9 +2191,14 @@ class SecureFile:
         salt_masking: Optional[str] = None,
         random_state: int = 42,
         verbose: bool = False,
+        columns: Optional[List[str]] = None,
+        filters: Optional[Dict] = None,
     ) -> pd.DataFrame:
         """
         Lê um arquivo `.dlk` e retorna um DataFrame mascarado.
+
+        v1.2.0: aceita columns= e filters= para column pruning e predicate
+        pushdown no nível Arrow — só aloca memória para os dados necessários.
 
         A janela de exposição do dado bruto é minimizada: ele existe na heap
         durante a desserialização e o mascaramento, sem ser exposto como
@@ -2071,12 +2206,15 @@ class SecureFile:
 
         Args:
             path:         Caminho para o arquivo `.dlk`.
-            master_key:   Chave mestre (a mesma usada no `pack()`).
+            key:          Chave mestre (a mesma usada no `pack()`).
             salt_masking: Salt HMAC para mascaramento. Se None e o arquivo
                           não tiver mascaramento pré-aplicado, usa salt aleatório
                           (hashes não reprodutíveis entre execuções).
             random_state: Semente para mockers.
             verbose:      Exibe relatório de colunas PII detectadas.
+            columns:      Lista de colunas a retornar. None = todas.
+            filters:      Dict de filtros para predicate pushdown. None = sem filtro.
+                          Ex: {"uf": "SP"}, {"renda": (">", 10_000)}
 
         Returns:
             DataFrame com dados mascarados.
@@ -2103,7 +2241,12 @@ class SecureFile:
             )
 
         payload_decrypted = _decompress_payload(payload_decrypted, header)
-        df_raw = _bytes_to_df(payload_decrypted)
+        df_raw = _bytes_to_df(
+            payload_decrypted,
+            columns=columns,
+            filters=filters,
+            row_groups_meta=header.get("row_groups") or None,
+        )
 
         # Strip canary rows do Nível 1 (arquivo) — transparente ao usuário
         canary_meta_header = header.get("canary") or header.get("metadata", {}).get("canary")
@@ -2153,16 +2296,23 @@ class SecureFile:
         key: Optional[str] = None,
         master_key: Optional[str] = None,  # deprecated alias
         columns: Optional[List[str]] = None,
+        filters: Optional[Dict] = None,
     ) -> pd.DataFrame:
         """
         Decifra um .dlk e retorna o DataFrame SEM aplicar mascaramento automático.
+
+        v1.2.0: aceita filters= para predicate pushdown no nível Arrow.
+        O payload inteiro é decifrado (AES-GCM exige isso), mas apenas os
+        batches e colunas relevantes são materializados em memória.
 
         AVISO: este método retorna dados potencialmente não mascarados.
         Use apenas em ambientes com controles de acesso adequados.
 
         Args:
             path:       Caminho para o arquivo `.dlk`.
-            master_key: Chave mestre.
+            key:        Chave mestre.
+            columns:    Lista de colunas a retornar. None = todas.
+            filters:    Dict de filtros para predicate pushdown. None = sem filtro.
 
         Returns:
             DataFrame com o conteúdo decifrado, sem mascaramento adicional.
@@ -2191,7 +2341,12 @@ class SecureFile:
             )
 
         payload_decrypted = _decompress_payload(payload_decrypted, header)
-        df = _bytes_to_df(payload_decrypted)
+        df = _bytes_to_df(
+            payload_decrypted,
+            columns=columns,
+            filters=filters,
+            row_groups_meta=header.get("row_groups") or None,
+        )
 
         # Strip canary rows do Nível 1 (arquivo).
         # load_raw() não injeta canary de Nível 2: o chamador usa load_raw()
@@ -2200,10 +2355,6 @@ class SecureFile:
             from datalock.canary import strip_canary
             df = strip_canary(df)
 
-        if columns:
-            existing = [c for c in columns if c in df.columns]
-            if existing:
-                df = df[existing]
         logger.info(
             "SecureFile.load_raw | %s | content_type=%s | shape=%s",
             p.name, content_type, df.shape,
@@ -2504,6 +2655,7 @@ class SecureFile:
         plaintext_size: int,
         metadata: Optional[Dict[str, Any]] = None,
         expires_at: Optional[str] = None,
+        row_groups_meta: Optional[List[Dict]] = None,
     ) -> Dict:
         import numpy as _np
         # Estatísticas de coluna acessíveis via dd.inspect() sem decifrar o payload.
@@ -2534,6 +2686,7 @@ class SecureFile:
         return {
             "format":               "lgs",
             "version":              "2.1",
+            "format_version":       "3.0",
             "content_type":         content_type,
             "label":                label,
             "created_at":           datetime.now(timezone.utc).isoformat(),
@@ -2550,6 +2703,7 @@ class SecureFile:
             "plaintext_size_bytes": plaintext_size,
             "metadata":             metadata or {},
             "expires_at":           expires_at or None,
+            "row_groups":           row_groups_meta or [],
         }
 
     @classmethod

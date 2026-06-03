@@ -30,6 +30,7 @@ df_back  = dd.read("clientes.dlk", key=KEY)  # decrypt and read back
 - [When to use datalock](#when-to-use-datalock)
 - [Core concepts](#core-concepts)
 - [Reading data](#reading-data)
+- [Column pruning and predicate pushdown](#column-pruning-and-predicate-pushdown)
 - [Detecting PII](#detecting-pii)
 - [Masking PII](#masking-pii)
 - [Storing encrypted files](#storing-encrypted-files-dlk)
@@ -149,6 +150,30 @@ df = dd.read("base.dlk", key=KEY, raw=True)
 ```
 
 **Supported formats:** `.csv` `.tsv` `.parquet` `.json` `.ndjson` `.jsonl` `.feather` `.ipc` `.arrow` `.avro` `.orc` `.xlsx` `.xls` `.ods` `.xml` `.html` `.dta` `.sas7bdat` `.sav` `.pkl` `.hdf` `.h5` `.dlk`
+
+### Column pruning and predicate pushdown
+
+Load only the columns and rows you need — without ever allocating the rest:
+
+```python
+# Only return specific columns (column pruning)
+df = dd.read("clientes.dlk", key=KEY, columns=["cpf", "uf", "renda_mensal"])
+
+# Return only rows matching a filter (predicate pushdown)
+df = dd.read("clientes.dlk", key=KEY, filters={"uf": "SP"})
+df = dd.read("clientes.dlk", key=KEY, filters={"renda_mensal": (">", 10_000)})
+df = dd.read("clientes.dlk", key=KEY, filters={"renda_mensal": (5_000, 50_000)})
+df = dd.read("clientes.dlk", key=KEY, filters={"uf": ["SP", "RJ", "MG"]})
+
+# Combined — minimal allocation
+df = dd.read("clientes.dlk", key=KEY,
+             columns=["cpf", "renda_mensal"],
+             filters={"uf": ["SP", "RJ"], "renda_mensal": (5_000, 50_000)})
+```
+
+**How it works:** the `.dlk` file stores per-batch statistics (`min`, `max`, `null_count`) in the encrypted header. At read time, batches incompatible with the filter are skipped before building any Python arrays. The entire ciphertext is still decrypted (AES-GCM requires it), but only relevant batches and columns are materialized. For a 1M-row × 50-column DataFrame, reading 2 columns with a 20%-selectivity filter allocates ~16 MB directly instead of 400 MB.
+
+Backward compatible: files written before v1.1.4 (no `row_groups` index in header) fall back to full reads without error.
 
 ### Big data — partial reads without OOM
 
@@ -818,7 +843,9 @@ Different `info` fields guarantee DEK ≠ HEK ≠ MAK even from the same master 
 - v3: multiple DataFrames in one file (payload is an in-memory ZIP)
 - v4: no encryption (for already-anonymized data in dev environments)
 
-**Payload serialization:** Apache Arrow IPC (not Parquet) — 3–5× faster for in-memory round-trips because Arrow IPC maps directly to Arrow's in-memory layout without Parquet's analytical overhead (row groups, column statistics, predicate pushdown structures). Compression (zstd by default) is applied before encryption. Backward-compatible with files using Parquet serialization via magic marker detection.
+**v1.1.4+ (format_version 3.0):** multi-batch payload with row group index. Files are fully backward-compatible — older readers ignore the `row_groups` header field.
+
+**Payload serialization:** Apache Arrow IPC (not Parquet) — 3–5× faster for in-memory round-trips because Arrow IPC maps directly to Arrow's in-memory layout without Parquet's analytical overhead. Starting from v1.1.4, the payload is serialized as a **stream of N independent record batches** (default 50 000 rows each). Per-batch statistics (`min`, `max`, `null_count`) are stored in the encrypted header, enabling predicate pushdown at read time without touching irrelevant batches. Compression (zstd by default) is applied before encryption. Backward-compatible with single-batch IPC and Parquet serialization from older versions via magic marker detection.
 
 ---
 
@@ -845,6 +872,10 @@ GPG and age encrypt arbitrary files with integrity. Use datalock instead when:
 ### datalock vs Apache Parquet encryption
 
 Parquet encryption provides per-column confidentiality but does **not** authenticate the file as a whole — a tampered encrypted Parquet file can return silently corrupted data without the reader detecting it. datalock verifies HMAC before any decryption, and then verifies GCM auth tags before returning any plaintext byte.
+
+For selective reads, Parquet column encryption decrypts each requested column chunk individually (fast). datalock decrypts the entire payload (AES-GCM over one block is required for the auth tag), but materializes only the requested batches and columns — the tradeoff is one full decryption pass vs. zero Python allocations for irrelevant data. For datasets where the bottleneck is memory allocation rather than I/O, datalock's approach wins.
+
+Additionally, datalock row group statistics live in the encrypted header, inaccessible without the key. Parquet stores column statistics in the plaintext footer by default — readable by anyone with file access.
 
 ### datalock vs S3 SSE / disk encryption
 
@@ -930,6 +961,8 @@ dd.read("arquivo.lgs", key=KEY) # also works
 |---|---|---|
 | `dd.read(path)` | path → `pl.DataFrame` | Read any format |
 | `dd.read(path, key=KEY)` | `.dlk` → `pl.DataFrame` | Decrypt and read |
+| `dd.read(path, key=KEY, columns=[...])` | `.dlk` → `pl.DataFrame` | Column pruning — return only listed columns |
+| `dd.read(path, key=KEY, filters={...})` | `.dlk` → `pl.DataFrame` | Predicate pushdown — return only matching rows |
 | `dd.store(df, path, key=KEY)` | DataFrame → `.dlk` | Encrypt and save |
 | `dd.mask(df, salt=SALT)` | DataFrame → same type | Mask PII columns |
 | `dd.scan(df)` | DataFrame → `Dict[str, ColumnReport]` | Detect PII |

@@ -1,5 +1,5 @@
 # Especificação Técnica do Formato `.dlk`
-### datalock v1.1.2 — Referência Completa
+### datalock v1.1.4 — Referência Completa
 
 ---
 
@@ -16,6 +16,7 @@
    - [v4 — Sem criptografia](#54-formato-v4--sem-criptografia)
 6. [Serialização do Payload](#6-serialização-do-payload)
 7. [Header JSON](#7-header-json)
+   - [Row Group Index (v1.2.0)](#71-row-group-index-v120)
 8. [Multi-frame: estrutura do ZIP interno](#8-multi-frame-estrutura-do-zip-interno)
 9. [ACL por frame](#9-acl-por-frame-datalock--112)
 10. [Canary Data](#10-canary-data)
@@ -233,6 +234,8 @@ O payload decifrado é um buffer binário com um magic marker nos primeiros 5 by
 
 **Arrow IPC** (formato atual): serialização binária colunar que mapeia diretamente o layout in-memory do Arrow, 3–5× mais rápido que Parquet para serialização em memória. Compressão interna via `IpcWriteOptions(compression=...)`.
 
+**Multi-batch stream (v1.2.0):** a partir de v1.1.4, o payload Arrow IPC é serializado como um _stream_ de N record batches independentes (padrão: 50 000 linhas por batch) em vez de um único batch monolítico. Isso habilita o índice de row groups no header e o predicate pushdown na leitura — veja §7.1.
+
 **Compressões suportadas:**
 
 | Valor no header `"compression"` | Algoritmo               | Versão |
@@ -255,6 +258,7 @@ O header é um objeto JSON UTF-8, cifrado (v2/v3) ou em claro (v1/v4). Campos co
 |-------------------------|----------|-----------|
 | `format`                | string   | sempre `"lgs"` |
 | `version`               | string   | versão do formato (`"2.1"`, `"3.0"`, `"3.1"`, `"4.0"`) |
+| `format_version`        | string   | versão do formato de serialização do payload (`"3.0"` a partir de v1.1.4) |
 | `content_type`          | string   | tipo do payload (ver abaixo) |
 | `label`                 | string   | rótulo livre para auditoria |
 | `created_at`            | ISO 8601 | timestamp UTC de criação |
@@ -287,12 +291,72 @@ O header é um objeto JSON UTF-8, cifrado (v2/v3) ou em claro (v1/v4). Campos co
 | `columns`        | array  | lista de nomes de colunas |
 | `column_stats`   | object | estatísticas por coluna (ver abaixo) |
 | `masking_applied`| bool   | indica se mascaramento foi pré-aplicado |
+| `row_groups`     | array  | índice de row groups para predicate pushdown (ver §7.1) |
 
 **`column_stats` por coluna:**
 
 Para `raw_dataframe`: apenas `dtype` (sem `n_nulls`, `n_unique`, `min`, `max` — suprimidos para evitar inferência sobre PII).
 
 Para `masked_dataframe` e `anonymous_dataframe`: `dtype`, `n_nulls`, `n_unique`, e para tipos numéricos `min`/`max`.
+
+---
+
+### 7.1 Row Group Index (v1.2.0)
+
+A partir de v1.1.4, o campo `"row_groups"` no header cifrado contém um índice dos record batches Arrow IPC que compõem o payload. Isso permite que a biblioteca leia apenas os batches relevantes para uma query, sem materializar o DataFrame inteiro.
+
+**Estrutura:**
+
+```json
+"row_groups": [
+  {
+    "batch_index":  0,
+    "byte_offset":  0,
+    "byte_length":  412800,
+    "n_rows":       50000,
+    "stats": {
+      "uf":           {"dtype": "object",  "min": "BA", "max": "MG", "null_count": 0},
+      "renda_mensal": {"dtype": "float64", "min": 900.0, "max": 25000.0, "null_count": 0}
+    }
+  },
+  {
+    "batch_index":  1,
+    "byte_offset":  412800,
+    "byte_length":  398400,
+    "n_rows":       50000,
+    "stats": { ... }
+  }
+]
+```
+
+**Política de exposição das stats:**
+- `raw_dataframe`: apenas `dtype` por coluna — `min`/`max`/`null_count` são suprimidos para evitar inferência sobre distribuições de PII.
+- `masked_dataframe` e demais tipos: `dtype`, `min`, `max`, `null_count` completos. Os valores são hashes HMAC — seguros para indexação.
+
+**Uso interno (transparente ao usuário):**
+
+Quando `dd.read("f.dlk", key=KEY, filters={"uf": "SP"})` é chamado:
+1. O header é decifrado (HEK) → `row_groups` lido.
+2. `prune_row_groups(row_groups, filters)` identifica os batch indices relevantes.
+3. O payload inteiro é decifrado (AES-GCM exige) e aberto como stream Arrow IPC.
+4. Apenas os batches relevantes são materializados; os demais são descartados sem construir arrays Python.
+5. `apply_arrow_filters(batch, filters)` aplica o filtro exato linha a linha dentro dos batches selecionados.
+
+**Formato aceito em `filters=`:**
+
+```python
+{"uf": "SP"}                              # igualdade
+{"uf": ["SP", "RJ"]}                      # in list
+{"renda_mensal": (">", 10_000)}           # comparação: >, >=, <, <=, !=
+{"renda_mensal": (5_000, 50_000)}         # range fechado [a, b]
+{"uf": "SP", "renda_mensal": (">", 5_000)} # múltiplas colunas (AND implícito)
+```
+
+**Retrocompatibilidade:** arquivos sem `"row_groups"` no header (escritos por versões anteriores) são lidos normalmente — `header.get("row_groups") → []` → pruning desabilitado → leitura completa. Sem erro, sem quebra.
+
+**Ganho de memória típico:** para um DataFrame de 1M linhas × 50 colunas (`~400 MB`), ler 2 colunas com filtro que retorna 20% das linhas aloca ~16 MB diretamente, sem passar por 400 MB.
+
+---
 
 **Campos exclusivos de multi-frame (v3):**
 
@@ -437,6 +501,8 @@ Alinhado com o princípio de limitação de retenção da LGPD (Art. 16) e do GD
 | v2 (0x02)   | ≥ 1.3.2             | ✓ leitura e escrita |
 | v3 (0x03)   | ≥ 1.5.0             | ✓ leitura e escrita |
 | v4 (0x04)   | ≥ 1.1.2             | ✓ leitura e escrita |
+
+Arquivos v2/v3 **sem** `"row_groups"` no header (escritos por datalock < 1.1.4) são lidos integralmente sem pruning — degradação graciosa, sem erro. O campo `"format_version": "3.0"` distingue arquivos novos dos antigos.
 
 Arquivos `.lgs` (formato anterior ao rename) são lidos identicamente via detecção automática.
 

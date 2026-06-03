@@ -405,6 +405,7 @@ def read(
     raw: bool = False,
     frame: Optional[str] = None,
     columns: Optional[List[str]] = None,
+    filters: Optional[Dict] = None,
     chunksize: Optional[int] = None,
     size: Optional[int] = None,
     verbose: bool = False,
@@ -510,8 +511,9 @@ def read(
             return SecureFile.load_frames(p, key=key, salt_masking=salt, verbose=verbose)
 
         if raw or not salt:
-            return SecureFile.load_raw(p, key=key, columns=columns)
-        return SecureFile.load(p, key=key, salt_masking=salt, verbose=verbose)
+            return SecureFile.load_raw(p, key=key, columns=columns, filters=filters)
+        return SecureFile.load(p, key=key, salt_masking=salt, verbose=verbose,
+                               columns=columns, filters=filters)
 
     # ── Outros formatos ───────────────────────────────────────────────────
     if not p.exists():

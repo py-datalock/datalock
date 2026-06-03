@@ -1,3 +1,44 @@
+## v1.1.4 (2026-06)
+
+### Column Pruning e Predicate Pushdown no `.dlk`
+
+**Motivação:** Para um DataFrame de 1M linhas × 50 colunas, acessar 2 colunas e 20% das linhas
+alocava 400 MB antes de filtrar para os ~16 MB necessários. Esta release elimina essa alocação.
+
+**`_df_to_bytes()` — serialização multi-batch**
+Serializa o payload como stream de N record batches Arrow IPC (padrão: 50 000 linhas/batch).
+Retorna `(bytes, list[dict])` com metadados de cada batch: `batch_index`, `byte_offset`,
+`byte_length`, `n_rows`, `stats` (`min`/`max`/`null_count` por coluna).
+Para `raw_dataframe`, stats expõem apenas `dtype` (política de exposição mínima).
+
+**`_bytes_to_df()` — desserialização seletiva**
+Aceita `columns=`, `filters=` e `row_groups_meta=`. Usa `prune_row_groups()` para
+identificar batches relevantes antes de construir arrays Python. Column pruning via
+`batch.select(columns)` no nível Arrow. Predicate pushdown via `apply_arrow_filters()`.
+Retrocompat: `row_groups_meta=None` → lê tudo; archivos antigos degradam graciosamente.
+
+**`_build_header()` — índice de row groups no header cifrado**
+Adiciona `"row_groups": [...]` e `"format_version": "3.0"` ao header.
+Leitores antigos ignoram campos desconhecidos — sem quebra de retrocompatibilidade.
+
+**`load_raw()` e `load()`** — novos parâmetros `filters=` e `columns=` propagados para `_bytes_to_df()`.
+
+**`dd.read()` em `__init__.py`** — novo parâmetro `filters=` propagado para `SecureFile.load_raw()` e `SecureFile.load()`.
+
+**Novo módulo `datalock/ipc_index.py`**
+Isola lógica de pruning e pushdown:
+  - `compute_batch_stats(batch, content_type)` — min/max/null_count por coluna
+  - `prune_row_groups(row_groups_meta, filters)` → `set[int]` de batches relevantes
+  - `apply_arrow_filters(batch, filters)` → `pa.RecordBatch` filtrado
+  - `normalize_filters(filters)` → lista canônica de tuplas `(col, op, value)`
+
+**Novo arquivo `tests/test_column_pruning.py`** — 7 cenários obrigatórios + testes unitários de `ipc_index`.
+
+**Ganho de memória estimado:** 25× para padrão `columns=2/50 + filters=20%` em 1M linhas.
+Tempo de decifração: idêntico (AES-GCM sobre payload inteiro, inescapável).
+
+---
+
 # Changelog — datalock
 
 ## v1.1.0 (2026-05)

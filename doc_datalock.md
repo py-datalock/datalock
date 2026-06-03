@@ -1,5 +1,5 @@
 # datalock — Documentação Completa
-### v1.1.2 — Privacy-by-Design para dados tabulares em Python
+### v1.1.4 — Privacy-by-Design para dados tabulares em Python
 
 ---
 
@@ -20,7 +20,9 @@
    - [dd.stream()](#58-ddstream--leitura-em-chunks)
    - [dd.write()](#59-ddwrite--escrita-de-arquivo-ou-banco)
    - [dd.sql()](#510-ddsql--sql-via-duckdb)
-6. [Mascaramento de texto livre](#6-mascaramento-de-texto-livre)
+5.5. [dd.inspect() com row_groups](#55-ddinspect--metadados-sem-decifrar)
+6. [Column pruning e predicate pushdown](#6-column-pruning-e-predicate-pushdown)
+7. [Mascaramento de texto livre](#7-mascaramento-de-texto-livre)
 7. [Análise e transformação](#7-análise-e-transformação)
 8. [Banco de dados](#8-banco-de-dados)
 9. [Pipeline fluente](#9-pipeline-fluente)
@@ -360,6 +362,19 @@ df = dd.read("clientes.csv", salt=SALT)
 # CSV com separador diferente
 df = dd.read("dados.csv", sep=";", encoding="latin-1")
 
+# Column pruning — retorna apenas as colunas solicitadas
+df = dd.read("clientes.dlk", key=KEY, columns=["cpf", "renda_mensal"])
+
+# Predicate pushdown — materializa apenas as linhas que satisfazem o filtro
+df = dd.read("clientes.dlk", key=KEY, filters={"uf": "SP"})
+df = dd.read("clientes.dlk", key=KEY, filters={"renda_mensal": (">", 10_000)})
+df = dd.read("clientes.dlk", key=KEY, filters={"renda_mensal": (5_000, 50_000)})
+
+# Combinado — mínimo de memória alocada
+df = dd.read("clientes.dlk", key=KEY,
+             columns=["cpf", "renda_mensal"],
+             filters={"uf": ["SP", "RJ"], "renda_mensal": (5_000, 50_000)})
+
 # Big data — leitura parcial sem OOM
 df   = dd.read("big.parquet", head=100_000)         # primeiras 100k linhas
 df   = dd.read("big.parquet", tail=50_000)          # últimas 50k linhas
@@ -530,7 +545,116 @@ result = dd.sql("SELECT * FROM df", df=df, salt=SALT)
 
 ---
 
-## 6. Mascaramento de texto livre
+## 7. Column Pruning e Predicate Pushdown
+
+A partir de v1.1.4, o formato `.dlk` suporta leitura seletiva de colunas e filtragem de linhas no nível Arrow IPC, sem materializar o DataFrame inteiro em memória.
+
+### Como funciona
+
+O payload é serializado como stream de N record batches Arrow IPC (padrão: 50 000 linhas/batch). Estatísticas por batch (`min`, `max`, `null_count` por coluna) são indexadas no header cifrado. Na leitura:
+
+1. O header é decifrado → índice de row groups lido.
+2. Batches incompatíveis com os filtros são identificados pelas stats e **pulados sem construir arrays Python**.
+3. O payload inteiro é decifrado (AES-GCM exige isso — inescapável).
+4. Apenas os batches relevantes são materializados; dentro deles, apenas as colunas pedidas.
+5. Filtros exatos são aplicados linha a linha via `pyarrow.compute`.
+
+O tempo de decifração é idêntico ao anterior. O ganho é na alocação de memória e na desserialização — que é onde o gargalo real está para datasets que cabem em disco mas não em RAM.
+
+### Ganho típico de memória
+
+```
+DataFrame: 1M linhas × 50 colunas × 8 bytes ≈ 400 MB
+
+columns=["uf", "renda"] + filters={"uf": "SP"} (20% das linhas):
+  Antes:  400 MB alocados → filtra para ~16 MB
+  Depois: ~16 MB alocados diretamente
+  Ganho:  25× menos memória para esse padrão de acesso
+```
+
+### API
+
+```python
+import datalock as dd
+
+KEY = os.environ["DATALOCK_KEY"]
+
+# Apenas colunas específicas
+df = dd.read("clientes.dlk", key=KEY, columns=["cpf", "uf", "renda_mensal"])
+
+# Filtro por igualdade
+df = dd.read("clientes.dlk", key=KEY, filters={"uf": "SP"})
+
+# Filtro por lista de valores
+df = dd.read("clientes.dlk", key=KEY, filters={"uf": ["SP", "RJ", "MG"]})
+
+# Filtro por comparação
+df = dd.read("clientes.dlk", key=KEY, filters={"renda_mensal": (">", 10_000)})
+df = dd.read("clientes.dlk", key=KEY, filters={"renda_mensal": (">=", 5_000)})
+df = dd.read("clientes.dlk", key=KEY, filters={"renda_mensal": ("<", 3_000)})
+
+# Filtro por range fechado [a, b]
+df = dd.read("clientes.dlk", key=KEY, filters={"renda_mensal": (5_000, 50_000)})
+
+# Range com lado aberto
+df = dd.read("clientes.dlk", key=KEY, filters={"renda_mensal": (5_000, None)})   # >= 5000
+df = dd.read("clientes.dlk", key=KEY, filters={"renda_mensal": (None, 50_000)})  # <= 50000
+
+# Múltiplas colunas — AND implícito
+df = dd.read("clientes.dlk", key=KEY, filters={
+    "uf": ["SP", "RJ"],
+    "renda_mensal": (5_000, 50_000),
+})
+
+# Combinado com column pruning
+df = dd.read("clientes.dlk", key=KEY,
+             columns=["cpf", "renda_mensal"],
+             filters={"uf": "SP", "renda_mensal": (">", 5_000)})
+
+# Via SecureFile diretamente
+from datalock.secure_file import SecureFile
+
+df = SecureFile.load_raw(
+    "clientes.dlk", key=KEY,
+    columns=["cpf", "uf"],
+    filters={"uf": "SP"},
+)
+
+df = SecureFile.load(
+    "clientes.dlk", key=KEY, salt_masking=SALT,
+    columns=["cpf", "uf", "renda_mensal"],
+    filters={"renda_mensal": (">", 10_000)},
+)
+```
+
+### Retrocompatibilidade
+
+Arquivos gravados por versões anteriores a v1.1.4 (sem `"row_groups"` no header) são lidos normalmente — o pruning é simplesmente desabilitado e todo o payload é materializado como antes. Nenhum erro, nenhuma mudança de comportamento para código existente.
+
+### Módulo `datalock.ipc_index`
+
+A lógica de pruning é isolada no módulo `datalock.ipc_index` para uso avançado:
+
+```python
+from datalock.ipc_index import (
+    normalize_filters,    # normaliza dict de filtros para lista canônica
+    compute_batch_stats,  # calcula min/max/null_count por coluna de um Arrow batch
+    prune_row_groups,     # retorna set[int] de batch indices relevantes
+    apply_arrow_filters,  # aplica filtros exatos linha a linha em um batch Arrow
+)
+
+# Normalizar filtros
+normalized = normalize_filters({"uf": "SP", "renda": (">", 5_000)})
+# → [("uf", "==", "SP"), ("renda", ">", 5000)]
+
+# Pruning manual
+relevant = prune_row_groups(row_groups_meta, {"uf": "SP"})
+# → {0, 2, 5}  — índices dos batches que podem conter linhas com uf="SP"
+```
+
+---
+
+## 8. Mascaramento de texto livre
 
 Detecta e mascara PII em strings de formato livre (logs, e-mails, notas de atendimento).
 
@@ -552,7 +676,7 @@ dd.mask_text(texto, salt=SALT, strategy="hash")
 
 ---
 
-## 7. Análise e transformação
+## 8. Análise e transformação
 
 O datalock expõe a API Polars via `dd.*`, permitindo manipulação de DataFrames sem importar Polars diretamente.
 
@@ -624,7 +748,7 @@ result = dd.join(df_clientes, df_pedidos, on="cpf", salt=SALT)
 
 ---
 
-## 8. Banco de dados
+## 9. Banco de dados
 
 ```python
 # Conexão
@@ -665,7 +789,7 @@ df = dd.read_db("postgresql://u:p@h/db",
 
 ---
 
-## 9. Pipeline fluente
+## 10. Pipeline fluente
 
 ```python
 result = (
@@ -689,7 +813,7 @@ result = (
 
 ---
 
-## 10. Contrato de dados
+## 11. Contrato de dados
 
 O `DataContract` unifica schema, validação de qualidade e regras de mascaramento em uma declaração versionável e exportável.
 
@@ -739,7 +863,7 @@ schema_json = contrato.to_json_schema()   # JSON Schema para documentação / DP
 
 ---
 
-## 11. Validação
+## 12. Validação
 
 ```python
 # Validação com regras declarativas
@@ -767,7 +891,7 @@ rules = dd.load_rules("regras/clientes.json")
 
 ---
 
-## 12. Canary data
+## 13. Canary data
 
 O sistema canary injeta linhas sentinela rastreáveis nos dados. Se os dados aparecerem em um breach, os fingerprints identificam o pipeline de origem.
 
@@ -798,7 +922,7 @@ dd.canary_check("canary_1ba472d8")
 
 ---
 
-## 13. Criptografia assimétrica
+## 14. Criptografia assimétrica
 
 Permite compartilhar arquivos `.dlk` sem compartilhar a chave simétrica.
 
@@ -827,7 +951,7 @@ dd.store(df, "dados.dlk", public_keys=[pub_alice, pub_bob, pub_carlos])
 
 ---
 
-## 14. Dados sintéticos
+## 15. Dados sintéticos
 
 ```python
 # Treinar modelo generativo (requer pip install "datalock[synthetic]")
@@ -853,7 +977,7 @@ gen.generate_row()
 
 ---
 
-## 15. Métricas de privacidade
+## 16. Métricas de privacidade
 
 ```python
 from datalock import check
@@ -892,7 +1016,7 @@ noisy_mean = dp.add_laplace_noise(df["renda_mensal"].mean(), sensitivity=1000)
 
 ---
 
-## 16. Varredura de diretório
+## 17. Varredura de diretório
 
 ```python
 # Inventário de PII em uma pasta
@@ -915,7 +1039,7 @@ for path, fi in inventario.items():
 
 ---
 
-## 17. Relatório de conformidade LGPD
+## 18. Relatório de conformidade LGPD
 
 ```python
 reports = dd.scan(df)
@@ -935,7 +1059,7 @@ report.to_json("lgpd_relatorio.json")
 
 ---
 
-## 18. Linhagem de dados
+## 19. Linhagem de dados
 
 ```python
 from datalock import lineage
@@ -950,7 +1074,7 @@ lineage.view(df_masked)
 
 ---
 
-## 19. CLI
+## 20. CLI
 
 A interface de linha de comando fornece acesso às principais operações sem escrever código.
 
@@ -990,7 +1114,7 @@ datalock profile clientes.csv --sample 1000
 
 ---
 
-## 20. Referência de tipos e classes
+## 21. Referência de tipos e classes
 
 ### `PIIType`
 `CPF`, `CNPJ`, `EMAIL`, `TELEFONE`, `NOME`, `DATA_NASCIMENTO`, `ENDERECO`, `CEP`, `IP_ADDRESS`, `CARTAO_CREDITO`, `CONTA_BANCARIA`, `SALARIO_RENDA`, `ETNIA`, `RELIGIAO`, `SAUDE`, `BIOMETRICO`, `PASSAPORTE`, `TITULO_ELEITOR`, `PLACA_VEICULO`, `GENERICO`
@@ -1027,7 +1151,7 @@ Lançada por `dd.mask(strict=True)` quando uma coluna já parece mascarada (evit
 
 ---
 
-## 21. Segurança: guia de boas práticas
+## 22. Segurança: guia de boas práticas
 
 ### Chaves e salts
 
@@ -1085,7 +1209,7 @@ dd.store(df_com_cpf, "dev_data.dlk")  # sem key= → v4 sem criptografia
 
 ---
 
-## 22. Retrocompatibilidade
+## 23. Retrocompatibilidade
 
 O datalock foi renomeado de `logus-lgpd`. O alias `import logus as lg` continua funcionando:
 
