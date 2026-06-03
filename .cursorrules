@@ -38,7 +38,7 @@ full pipeline:          `result = dd.process("in.csv", salt=SALT, key=KEY, outpu
 ## dd.col IS polars.col
 dd.col("x").over("group")  dd.col("x").rank("dense")  dd.col("x").str.to_lowercase()
 
-## New in v1.1.2
+## New in v1.1.3
 canary:    dd.store(df, "f.dlk", key=KEY, canary=True)  # transparent inject/strip
 semantic:  dd.mask_text(text, salt=SALT, strategy="semantic")  # valid fake CPF/email
 scandir:   dd.scan_directory("./data/", min_risk="medium").to_html("report.html")

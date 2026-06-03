@@ -4,14 +4,25 @@ datalock CLI — Interface de linha de comando.
 Uso:
     datalock scan   arquivo.csv [--sample 500] [--threshold 0.5]
     datalock mask   arquivo.csv --salt SALT [--output mascarado.csv]
-    datalock inspect arquivo.dlk [--key CHAVE]
-    datalock pack   arquivo.csv --key CHAVE [--output arquivo.dlk]
-    datalock unpack arquivo.dlk --key CHAVE [--output arquivo.csv]
+    datalock inspect arquivo.dlk
+    datalock pack   arquivo.csv [--output arquivo.dlk]
+    datalock unpack arquivo.dlk [--output arquivo.csv]
     datalock profile arquivo.csv [--sample 500]
+
+Chave de criptografia (master_key):
+    A chave NUNCA deve ser passada como argumento de linha de comando —
+    isso a expõe em logs de processo (/proc/<pid>/cmdline), histórico de
+    shell (.bash_history) e saída de `ps aux`.
+
+    Forneça a chave por um destes métodos (em ordem de precedência):
+      1. Variável de ambiente:  export DATALOCK_KEY="<chave>"
+      2. Prompt interativo:     a CLI solicita a chave de forma oculta
+                                quando DATALOCK_KEY não está definida.
 """
 from __future__ import annotations
 
 import argparse
+import getpass
 import json
 import os
 import sys
@@ -25,11 +36,33 @@ def _get_salt(salt_arg: str | None) -> str | None:
     return os.environ.get("DATALOCK_SALT")
 
 
-def _get_key(key_arg: str | None) -> str | None:
-    """Aceita key como arg direto ou via variável de ambiente DATALOCK_KEY."""
-    if key_arg:
-        return key_arg
-    return os.environ.get("DATALOCK_KEY")
+def _get_key(*, required: bool = True) -> str | None:
+    """
+    Obtém a master_key de forma segura — nunca de argumentos de linha de comando.
+
+    Precedência:
+      1. Variável de ambiente DATALOCK_KEY
+      2. Prompt interativo oculto (getpass) — a chave não é exibida no terminal
+         nem fica no histórico de shell.
+
+    A chave NÃO é aceita como argumento CLI para evitar exposição em:
+      - /proc/<pid>/cmdline (visível a outros processos no sistema)
+      - Histórico do shell (.bash_history, .zsh_history)
+      - Logs de auditoria de sistema que registram argumentos de processos
+    """
+    env_key = os.environ.get("DATALOCK_KEY")
+    if env_key:
+        return env_key
+    if not required:
+        return None
+    try:
+        key = getpass.getpass("master_key (DATALOCK_KEY): ")
+    except (KeyboardInterrupt, EOFError):
+        print("\nOperação cancelada.", file=sys.stderr)
+        sys.exit(1)
+    if not key:
+        return None
+    return key
 
 
 def cmd_scan(args: argparse.Namespace) -> int:
@@ -100,7 +133,7 @@ def cmd_inspect(args: argparse.Namespace) -> int:
         print(f"Erro: arquivo não encontrado: {path}", file=sys.stderr)
         return 1
 
-    key = _get_key(args.key)
+    key = _get_key(required=False)
     try:
         info = dd.inspect(str(path), key=key)
     except Exception as exc:
@@ -125,9 +158,9 @@ def cmd_pack(args: argparse.Namespace) -> int:
         print(f"Erro: arquivo não encontrado: {path}", file=sys.stderr)
         return 1
 
-    key = _get_key(args.key)
+    key = _get_key(required=True)
     if not key:
-        print("Erro: --key obrigatório (ou defina DATALOCK_KEY)", file=sys.stderr)
+        print("Erro: master_key obrigatória. Defina DATALOCK_KEY ou forneça via prompt.", file=sys.stderr)
         return 1
 
     out = args.output or path.with_suffix(".dlk")
@@ -144,7 +177,7 @@ def cmd_unpack(args: argparse.Namespace) -> int:
         print(f"Erro: arquivo não encontrado: {path}", file=sys.stderr)
         return 1
 
-    key = _get_key(args.key)
+    key = _get_key(required=True)
     df = dd.read(str(path), key=key, raw=True)
 
     out = Path(args.output) if args.output else path.with_suffix(".csv")
@@ -200,19 +233,16 @@ def main() -> int:
     # inspect
     p_ins = sub.add_parser("inspect", help="Inspeciona metadados de arquivo .dlk")
     p_ins.add_argument("file")
-    p_ins.add_argument("--key", default=None)
 
     # pack
     p_pack = sub.add_parser("pack", help="Empacota arquivo em .dlk cifrado")
     p_pack.add_argument("file")
-    p_pack.add_argument("--key", default=None)
     p_pack.add_argument("--output", "-o", default=None)
     p_pack.add_argument("--force", "-f", action="store_true")
 
     # unpack
     p_unp = sub.add_parser("unpack", help="Extrai arquivo .dlk")
     p_unp.add_argument("file")
-    p_unp.add_argument("--key", default=None)
     p_unp.add_argument("--output", "-o", default=None)
 
     # profile

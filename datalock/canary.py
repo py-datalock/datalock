@@ -94,12 +94,33 @@ def _get_canary_salt() -> str:
       1. _CANARY_SALT_OVERRIDE (configurado via dd.configure(canary_salt=...))
       2. Variável de ambiente DATALOCK_CANARY_SALT
       3. _CANARY_SALT_DEFAULT (fallback público — adequado apenas para testes)
+
+    Segurança:
+      O salt padrão (_CANARY_SALT_DEFAULT) é público no código-fonte.
+      Em produção, qualquer adversário com acesso ao código pode pré-calcular
+      os fingerprints canary para qualquer pipeline_id e remover as linhas
+      antes de vazar os dados — tornando o mecanismo ineficaz.
+
+      Quando o fallback público for usado, um UserWarning é emitido para
+      alertar administradores. O warning pode ser suprimido configurando
+      DATALOCK_CANARY_SALT no ambiente (o que também resolve o risco de segurança).
     """
     if _CANARY_SALT_OVERRIDE is not None:
         return _CANARY_SALT_OVERRIDE
     env_val = os.environ.get("DATALOCK_CANARY_SALT")
     if env_val:
         return env_val
+
+    import warnings as _warnings
+    _warnings.warn(
+        "datalock canary: usando salt padrão público (DATALOCK_CANARY_SALT não configurado). "
+        "Em produção, um adversário com acesso ao código-fonte pode pré-calcular e remover "
+        "linhas canary antes de vazar os dados, tornando a detecção de vazamentos ineficaz. "
+        "Configure DATALOCK_CANARY_SALT via variável de ambiente ou dd.configure(canary_salt=...) "
+        "para proteger a integridade do mecanismo de rastreamento.",
+        UserWarning,
+        stacklevel=4,
+    )
     return _CANARY_SALT_DEFAULT
 
 # Column used to mark canary rows in the payload
@@ -545,9 +566,12 @@ def canary_check(token: str, manifest_path: Optional[Path] = None) -> Optional[D
             try:
                 entry = json.loads(line)
                 stored_fps = entry.get("fingerprints", [])
-                if fp in stored_fps or any(
-                    sfp.startswith(fp) or fp.startswith(sfp) for sfp in stored_fps
-                ):
+                # Comparação exata apenas — a comparação por prefixo (startswith)
+                # foi removida porque produzia falsos positivos: um fingerprint
+                # de 6 chars poderia colidir com qualquer fingerprint armazenado
+                # que compartilhasse o mesmo prefixo, gerando atribuições erradas
+                # de vazamentos e potencialmente permitindo confundir rastreamento.
+                if fp in stored_fps:
                     return {
                         "fingerprint":       fp,
                         "pipeline_id":       entry["pipeline_id"],

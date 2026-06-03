@@ -30,10 +30,13 @@ Padrões suportados:
 """
 from __future__ import annotations
 
+import logging
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Union
 
 import pandas as pd
+
+logger = logging.getLogger(__name__)
 
 
 class DlkFile:
@@ -169,6 +172,13 @@ class DlkFile:
         Adiciona ou substitui um frame em arquivo multi-frame.
 
         Se o arquivo ainda não existe ou é single-frame, converte para multi-frame.
+
+        Segurança:
+          Na conversão single-frame → multi-frame, o conteúdo existente é lido
+          via SecureFile.load_raw() (sem mascaramento adicional), evitando que
+          dados já mascarados sejam mascarados duas vezes ao serem reescritos.
+          O mascaramento duplo corromperia hashes HMAC existentes e quebraria
+          joins entre tabelas mascaradas pelo mesmo pipeline.
         """
         from datalock.secure_file import SecureFile
 
@@ -177,11 +187,16 @@ class DlkFile:
             info = self.info()
             ct = info.get("content_type", "")
             if ct == SecureFile.CONTENT_TYPE_MULTI:
-                existing = self.frames()
+                # Multi-frame: lê todos os frames sem mascaramento adicional
+                existing = SecureFile.load_frames(
+                    self.path, key=self._key
+                ) if self._key else {}
             elif ct in (SecureFile.CONTENT_TYPE_RAW, SecureFile.CONTENT_TYPE_MASKED):
                 # single-frame → converte para multi-frame usando o nome do arquivo
+                # load_raw() garante que não há mascaramento adicional sobre dados
+                # que já podem estar mascarados (content_type=masked_dataframe)
                 base_name = self.path.stem
-                existing = {base_name: self.read(raw=True)}
+                existing = {base_name: SecureFile.load_raw(self.path, key=self._key)}
 
         existing[name] = df
         return self.write(existing, overwrite=overwrite)
@@ -210,13 +225,24 @@ class DlkFile:
 
         Mais conciso que SecureFile.verify() para uso em condicionais.
 
+        Segurança:
+          Exceções (FileNotFoundError, IOError, etc.) são capturadas e
+          retornam False — __bool__ nunca deve lançar exceção, e uma race
+          condition entre exists() e verify() não deve propagar erro para
+          o chamador. Erros inesperados são logados para não silenciar
+          falhas legítimas de forma completamente invisível.
+
         Exemplo:
             if not f.valid():
                 raise RuntimeError("Arquivo corrompido!")
         """
         from datalock.secure_file import SecureFile
-        ok, _ = SecureFile.verify(str(self.path), master_key=self._key)
-        return ok
+        try:
+            ok, _ = SecureFile.verify(str(self.path), master_key=self._key)
+            return ok
+        except Exception as exc:
+            logger.debug("DlkFile.valid() caught exception for '%s': %s", self.path, exc)
+            return False
 
     def frame_names(self) -> List[str]:
         """Retorna nomes dos frames (multi-frame) sem decifrar o payload."""

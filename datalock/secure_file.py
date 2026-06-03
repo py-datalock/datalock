@@ -147,6 +147,13 @@ AUTH_TAG_LEN   = 16          # bytes — tag de autenticação AEAD
 FILE_HMAC_LEN  = 32          # bytes — HMAC-SHA256 do arquivo completo
 HEADER_LEN_FMT = ">I"        # big-endian uint32 para comprimento do header cifrado
 
+# Tamanho máximo permitido para o header JSON (cifrado ou em claro).
+# Um header legítimo raramente ultrapassa alguns KB; 1 MB é generoso.
+# Sem este limite, um arquivo malformado com header_len=0xFFFFFFFF (~4 GB)
+# pode causar tentativa de alocação massiva de memória (DoS) — especialmente
+# relevante para arquivos v4 cujo HMAC usa chave pública e pode ser forjado.
+MAX_HEADER_LEN = 1 * 1024 * 1024  # 1 MB
+
 # Mapa cipher byte → string name
 _CIPHER_BYTE_TO_STR = {CIPHER_AES256GCM: "AES256GCM", CIPHER_CHACHA20POLY1305: "ChaCha20Poly1305"}
 _CIPHER_STR_TO_BYTE = {v: k for k, v in _CIPHER_BYTE_TO_STR.items()}
@@ -593,8 +600,12 @@ def _acl_zip_bytes_to_single_frame(
         index: List[Dict] = json.loads(zf.read(_MULTI_FRAME_INDEX).decode("utf-8"))
         entry = next((e for e in index if e["name"] == frame), None)
         if entry is None:
-            available = [e["name"] for e in index]
-            raise KeyError(f"Frame '{frame}' não encontrado. Disponíveis: {available}")
+            # Não listar frames disponíveis: em contexto ACL isso revelaria
+            # nomes de frames confidenciais para usuários sem acesso a eles.
+            raise KeyError(
+                f"Frame '{frame}' não encontrado. "
+                "Use SecureFile.verify() ou load_frames() para listar os frames acessíveis."
+            )
 
         level  = entry.get("access_level", "internal")
         is_acl = entry.get("acl_encrypted", False)
@@ -862,6 +873,12 @@ def _parse_v2_header_only(raw: bytes, master_key_bytes: bytes) -> Dict:
     salt_kdf     = raw[offset:offset + SALT_KDF_LEN];  offset += SALT_KDF_LEN
     nonce_header = raw[offset:offset + NONCE_LEN];      offset += NONCE_LEN
     header_ct_len = struct.unpack(HEADER_LEN_FMT, raw[offset:offset + 4])[0]; offset += 4
+    if header_ct_len > MAX_HEADER_LEN:
+        raise ValueError(
+            f"Header cifrado excede o tamanho máximo permitido "
+            f"({header_ct_len} bytes > {MAX_HEADER_LEN} bytes). "
+            "Arquivo possivelmente malformado ou corrompido."
+        )
     header_ct_with_tag = raw[offset:offset + header_ct_len]
     header_ct  = header_ct_with_tag[:-AUTH_TAG_LEN]
     header_tag = header_ct_with_tag[-AUTH_TAG_LEN:]
@@ -1009,12 +1026,19 @@ def _write_lgs(
     salt_kdf: quando fornecido (arquivos v2/v3), o FILE_HMAC é calculado com a
     MAK derivada via HKDF — separação de domínio completa. Para v1 e v4 (sem
     salt_kdf disponível), usa master_key_bytes diretamente para retrocompatibilidade.
-    A escrita atômica via rename garante que o arquivo destino nunca fica num
-    estado parcialmente escrito em caso de interrupção do processo.
+
+    Segurança de concorrência:
+      O arquivo temporário usa um nome único por chamada (uuid4) em vez de um
+      sufixo fixo (.dlk.tmp). Isso evita que duas threads/processos que escrevam
+      no mesmo `output` simultaneamente usem o mesmo caminho temporário, o que
+      resultaria em corrupção silenciosa do arquivo destino. A operação
+      tmp.replace(output) continua atômica no mesmo filesystem.
     """
+    import uuid as _uuid
     hmac_key_bytes = master_key_bytes if master_key_bytes is not None else _NO_KEY_HMAC_KEY
     file_hmac = _compute_file_hmac(hmac_key_bytes, body, salt_kdf)
-    tmp = output.with_suffix(".dlk.tmp")
+    # Nome único por chamada: evita colisão entre escritas paralelas ao mesmo output
+    tmp = output.parent / f".{output.name}.{_uuid.uuid4().hex}.tmp"
     try:
         output.parent.mkdir(parents=True, exist_ok=True)
         tmp.write_bytes(body + file_hmac)
@@ -1025,13 +1049,72 @@ def _write_lgs(
 
 
 def _validate_key(master_key: str) -> bytes:
-    """Valida comprimento mínimo e retorna bytes UTF-8."""
+    """
+    Valida comprimento mínimo e retorna bytes UTF-8.
+
+    Segurança — HKDF vs KDF de senha:
+      HKDF-SHA256 é um KDF de *expansão*, não de *stretching*. Ele pressupõe
+      que o IKM (input key material) já é criptograficamente forte (saída de
+      KMS, os.urandom, vault). Se uma senha humana for fornecida como master_key,
+      um adversário com o arquivo pode testá-la a bilhões de tentativas/s com GPU.
+
+      Para chaves derivadas de senhas humanas, aplique Argon2id ou PBKDF2-SHA256
+      (≥600.000 iterações) antes de passar o resultado aqui.
+
+      Para ambientes corporativos, gere a master_key via:
+        python -c "import secrets; print(secrets.token_hex(32))"
+      e armazene no vault (AWS Secrets Manager, HashiCorp Vault, Azure Key Vault).
+    """
+    import math
+    import warnings as _warnings
+
     encoded = master_key.encode("utf-8")
     if len(encoded) < 16:
         raise ValueError(
             "master_key muito curta (mínimo 16 bytes). "
             "Use uma chave de alta entropia para proteger dados pessoais."
         )
+
+    # Heurística de entropia de Shannon para detectar senhas humanas.
+    # Chaves de alta entropia (saída de KMS/urandom/token_hex) têm
+    # distribuição quase uniforme → Shannon entropy próxima ao máximo.
+    # Senhas humanas e frases comuns têm entropia típica < 3.5 bits/char.
+    freq: dict = {}
+    for c in master_key:
+        freq[c] = freq.get(c, 0) + 1
+    n = len(master_key)
+    shannon = -sum((f / n) * math.log2(f / n) for f in freq.values())
+    n_unique = len(freq)
+
+    _WEAK_KEY_PATTERNS = frozenset({
+        "password", "senha", "chave", "key", "secret", "segredo",
+        "admin", "master", "test", "teste", "demo", "example", "exemplo",
+        "123456", "abcdef", "qwerty",
+    })
+    lower = master_key.lower()
+    has_weak_pattern = any(p in lower for p in _WEAK_KEY_PATTERNS)
+
+    # Limites: chaves de 32 hex chars têm ~4 bits/char (alphabet de 16 símbolos)
+    # e n_unique ≈ 16. Senhas humanas típicas têm < 3.5 bits/char ou < 10 únicos.
+    low_entropy = (n_unique < 10 or shannon < 3.5) and len(master_key) < 48
+
+    if has_weak_pattern or low_entropy:
+        reasons = []
+        if has_weak_pattern:
+            reasons.append("contém palavra-chave fraca")
+        if low_entropy:
+            reasons.append(
+                f"baixa entropia estimada ({shannon:.1f} bits/char, {n_unique} chars únicos)"
+            )
+        _warnings.warn(
+            f"master_key com possível baixa entropia ({'; '.join(reasons)}). "
+            "HKDF não é um KDF de senhas — use material de alta entropia "
+            "(saída de KMS, secrets.token_hex(32), vault). "
+            "Para senhas humanas, aplique Argon2id antes de passar a chave aqui.",
+            UserWarning,
+            stacklevel=3,
+        )
+
     return encoded
 
 
@@ -1237,6 +1320,12 @@ class SecureFile:
         offset = len(MAGIC) + 1
         header_len = struct.unpack(HEADER_LEN_FMT, body[offset:offset + 4])[0]
         offset += 4
+        if header_len > MAX_HEADER_LEN:
+            raise ValueError(
+                f"Header JSON excede o tamanho máximo permitido "
+                f"({header_len} bytes > {MAX_HEADER_LEN} bytes). "
+                "Arquivo possivelmente malformado ou corrompido."
+            )
         header = json.loads(body[offset:offset + header_len].decode("utf-8"))
         offset += header_len
         payload_bytes = body[offset:]
@@ -1779,14 +1868,10 @@ class SecureFile:
 
         t0 = time.perf_counter()
         master_key_bytes = key.encode("utf-8")
-        header, payload_decrypted = cls._decrypt_file(p, master_key_bytes)
+        header, payload_decrypted, salt_kdf = cls._decrypt_file(p, master_key_bytes)
 
         cls._assert_multi_frame(header, p)
         payload_decrypted = _decompress_payload(payload_decrypted, header)
-
-        # Extrai salt_kdf do arquivo para reuso nas DEKs de frame
-        raw = p.read_bytes()
-        salt_kdf = raw[7:7 + SALT_KDF_LEN]  # MAGIC(5)+VERSION(1)+CIPHER(1)
 
         acl_enabled = header.get("acl_enabled", False)
         if acl_enabled:
@@ -1837,12 +1922,9 @@ class SecureFile:
             raise FileNotFoundError(f"Arquivo não encontrado: {path}")
 
         master_key_bytes = key.encode("utf-8")
-        header, payload_decrypted = cls._decrypt_file(p, master_key_bytes)
+        header, payload_decrypted, salt_kdf = cls._decrypt_file(p, master_key_bytes)
         cls._assert_multi_frame(header, p)
         payload_decrypted = _decompress_payload(payload_decrypted, header)
-
-        raw = p.read_bytes()
-        salt_kdf = raw[7:7 + SALT_KDF_LEN]
 
         acl_enabled = header.get("acl_enabled", False)
         cipher_str  = header.get("encryption", "AES256GCM")
@@ -1879,27 +1961,38 @@ class SecureFile:
         """
         Empacota payload binário arbitrário em .dlk.
 
-        Uso: para arquivos que não são DataFrames — logs, modelos serializados
-        (pickle), arquivos de configuração, relatórios PDF, etc.
+        Uso: para arquivos que não são DataFrames — logs, modelos serializados,
+        arquivos de configuração, relatórios PDF, etc.
 
         Args:
             payload:      Bytes a empacotar.
             output_path:  Caminho do .dlk de saída.
-            master_key:   Chave mestre (≥ 16 chars).
+            key:          Chave mestre (≥ 16 chars).
             content_type: Descrição do conteúdo (ex: "bytes", "pickle_model").
             label:        Rótulo livre para o header.
             compress:     Compressão zlib antes de cifrar.
             overwrite:    Sobrescreve arquivo existente.
+
+        AVISO DE SEGURANÇA — Pickle e formatos de serialização arbitrários:
+            `pickle.loads()` executa código Python arbitrário durante a deserialização.
+            Qualquer pessoa que possua a master_key pode criar um payload que execute
+            código arbitrário na máquina do receptor ao chamar `pickle.loads(raw)`.
+
+            Boas práticas para payloads pickle:
+              - Nunca deserialize payload de fonte não confiável, mesmo com key correta.
+              - Prefira formatos seguros: ONNX, SafeTensors, joblib com hash verificado.
+              - Restrinja ao máximo quem tem acesso à master_key de arquivos pickle_model.
 
         Exemplo:
             import pickle
             model_bytes = pickle.dumps(gen._model)
             SecureFile.pack_bytes(
                 model_bytes, "modelo_ctgan.dlk",
-                master_key="chave", content_type="pickle_model",
+                key="chave", content_type="pickle_model",
                 label="ctgan_clientes_v1"
             )
-            raw = SecureFile.load_bytes("modelo_ctgan.dlk", master_key="chave")
+            raw = SecureFile.load_bytes("modelo_ctgan.dlk", key="chave")
+            # AVISO: Só deserialize se confiar completamente na origem do arquivo.
             model = pickle.loads(raw)
         """
         output = Path(output_path)
@@ -1999,7 +2092,7 @@ class SecureFile:
 
         t0 = time.perf_counter()
         master_key_bytes = key.encode("utf-8")
-        header, payload_decrypted = cls._decrypt_file(p, master_key_bytes)
+        header, payload_decrypted, _salt_kdf = cls._decrypt_file(p, master_key_bytes)
 
         # Rejeita multi-frame com mensagem clara
         if header.get("content_type") == SecureFile.CONTENT_TYPE_MULTI:
@@ -2082,7 +2175,7 @@ class SecureFile:
         if not p.exists():
             raise FileNotFoundError(f"Arquivo não encontrado: {path}")
         master_key_bytes = key.encode("utf-8")
-        header, payload_decrypted = cls._decrypt_file(p, master_key_bytes)
+        header, payload_decrypted, _salt_kdf = cls._decrypt_file(p, master_key_bytes)
 
         content_type = header.get("content_type", "raw_dataframe")
         if content_type == SecureFile.CONTENT_TYPE_BYTES:
@@ -2142,7 +2235,7 @@ class SecureFile:
         if not p.exists():
             raise FileNotFoundError(f"Arquivo não encontrado: {path}")
         master_key_bytes = key.encode("utf-8")
-        header, payload_decrypted = cls._decrypt_file(p, master_key_bytes)
+        header, payload_decrypted, _salt_kdf = cls._decrypt_file(p, master_key_bytes)
         payload_decrypted = _decompress_payload(payload_decrypted, header)
         logger.info("SecureFile.load_bytes | %s | %d bytes", p.name, len(payload_decrypted))
         return payload_decrypted
@@ -2186,7 +2279,7 @@ class SecureFile:
 
         t0 = time.perf_counter()
         master_key_bytes = key.encode("utf-8")
-        header, payload_decrypted = cls._decrypt_file(p, master_key_bytes)
+        header, payload_decrypted, _salt_kdf = cls._decrypt_file(p, master_key_bytes)
 
         cls._assert_multi_frame(header, p)
         payload_decrypted = _decompress_payload(payload_decrypted, header)
@@ -2246,7 +2339,7 @@ class SecureFile:
 
         t0 = time.perf_counter()
         master_key_bytes = key.encode("utf-8")
-        header, payload_decrypted = cls._decrypt_file(p, master_key_bytes)
+        header, payload_decrypted, _salt_kdf = cls._decrypt_file(p, master_key_bytes)
 
         cls._assert_multi_frame(header, p)
         payload_decrypted = _decompress_payload(payload_decrypted, header)
@@ -2322,6 +2415,10 @@ class SecureFile:
                 offset = len(MAGIC) + 1
                 header_len = struct.unpack(HEADER_LEN_FMT, body[offset:offset + 4])[0]
                 offset += 4
+                if header_len > MAX_HEADER_LEN:
+                    return LGSInfo(False, {
+                        "error": f"Header excede tamanho máximo ({header_len} > {MAX_HEADER_LEN} bytes)"
+                    })
                 header = json.loads(body[offset:offset + header_len].decode("utf-8"))
                 return LGSInfo(True, {
                     "valid":          True,
@@ -2410,26 +2507,26 @@ class SecureFile:
     ) -> Dict:
         import numpy as _np
         # Estatísticas de coluna acessíveis via dd.inspect() sem decifrar o payload.
-        # Para raw_dataframe (dados não mascarados), min/max de colunas numéricas
-        # são suprimidos: esses valores podem revelar distribuições de dados sensíveis
-        # (ex: faixa de renda, score mínimo) sem que o auditor precise ver o payload.
-        # Para masked_dataframe, min/max de hashes HMAC são informativamente vazios
-        # e podem ser incluídos sem risco.
-        expose_range = (content_type != SecureFile.CONTENT_TYPE_RAW)
+        # Para raw_dataframe (dados não mascarados), apenas o dtype é exposto:
+        #   - min/max podem revelar distribuições de dados sensíveis (faixa de renda, etc.)
+        #   - n_unique pode revelar cardinalidade de campos PII (ex: 1 único = coluna constante)
+        #   - n_nulls pode revelar completude de campos sensíveis (ex: 0 nulos = CPF preenchido
+        #     para todos os registros, confirmando presença de dado pessoal identificável)
+        # Para masked_dataframe, todas as estatísticas são seguras: os valores são hashes HMAC.
+        expose_stats = (content_type != SecureFile.CONTENT_TYPE_RAW)
         col_stats = {}
         for col in df.columns:
             try:
                 s = df[col]
-                stat = {
-                    "dtype":    str(df[col].dtype),
-                    "n_nulls":  int(s.isna().sum()),
-                    "n_unique": int(s.nunique()),
-                }
-                if expose_range and hasattr(s, "dtype") and str(s.dtype) in (
-                    "float64", "float32", "int64", "int32", "int16", "int8"
-                ):
-                    stat["min"] = float(s.min()) if not s.empty else None
-                    stat["max"] = float(s.max()) if not s.empty else None
+                stat: Dict[str, Any] = {"dtype": str(df[col].dtype)}
+                if expose_stats:
+                    stat["n_nulls"]  = int(s.isna().sum())
+                    stat["n_unique"] = int(s.nunique())
+                    if hasattr(s, "dtype") and str(s.dtype) in (
+                        "float64", "float32", "int64", "int32", "int16", "int8"
+                    ):
+                        stat["min"] = float(s.min()) if not s.empty else None
+                        stat["max"] = float(s.max()) if not s.empty else None
                 col_stats[col] = stat
             except Exception:
                 col_stats[col] = {"dtype": str(df[col].dtype) if col in df.columns else "unknown"}
@@ -2468,7 +2565,7 @@ class SecureFile:
     @classmethod
     def _decrypt_file(
         cls, path: Path, master_key_bytes: bytes
-    ) -> Tuple[Dict, bytes]:
+    ) -> Tuple[Dict, bytes, Optional[bytes]]:
         """
         Lê, verifica e decifra um arquivo .dlk.
 
@@ -2477,7 +2574,11 @@ class SecureFile:
           v2 (0x02): header cifrado, cipher negociado, DEK/HEK separados.
           v3 (0x03): igual ao v2, mas content_type=multi_dataframe.
 
-        Retorna (header_dict, payload_decrypted_bytes).
+        Retorna (header_dict, payload_decrypted_bytes, salt_kdf_or_None).
+
+        O salt_kdf é retornado diretamente do raw já lido, eliminando a
+        necessidade de releitura do arquivo nos paths ACL (fix TOCTOU).
+        Para v1, salt_kdf é None (não disponível no offset fixo).
         Lança RuntimeError em qualquer falha de integridade.
         """
         raw = path.read_bytes()
@@ -2514,10 +2615,12 @@ class SecureFile:
             )
 
         if file_version == VERSION_V1:
-            return cls._parse_v1(raw, master_key_bytes)
+            header, payload = cls._parse_v1(raw, master_key_bytes)
+            return header, payload, None  # salt_kdf não disponível em offset fixo no v1
 
         # v2 e v3 têm estrutura idêntica
-        return cls._parse_v2(raw, master_key_bytes)
+        header, payload = cls._parse_v2(raw, master_key_bytes)
+        return header, payload, salt_kdf_for_hmac  # reutiliza salt já extraído
 
     @staticmethod
     def _parse_v1(raw: bytes, master_key_bytes: bytes) -> Tuple[Dict, bytes]:
@@ -2525,6 +2628,12 @@ class SecureFile:
         offset = len(MAGIC) + 1  # skip MAGIC + VERSION
         header_len = struct.unpack(HEADER_LEN_FMT, raw[offset:offset + 4])[0]
         offset += 4
+        if header_len > MAX_HEADER_LEN:
+            raise ValueError(
+                f"Header JSON excede o tamanho máximo permitido "
+                f"({header_len} bytes > {MAX_HEADER_LEN} bytes). "
+                "Arquivo possivelmente malformado ou corrompido."
+            )
         header = json.loads(raw[offset:offset + header_len].decode("utf-8"))
         offset += header_len
         salt_kdf  = raw[offset:offset + SALT_KDF_LEN];  offset += SALT_KDF_LEN
@@ -2547,6 +2656,12 @@ class SecureFile:
         nonce_header  = raw[offset:offset + NONCE_LEN];     offset += NONCE_LEN
         header_ct_len = struct.unpack(HEADER_LEN_FMT, raw[offset:offset + 4])[0]
         offset += 4
+        if header_ct_len > MAX_HEADER_LEN:
+            raise ValueError(
+                f"Header cifrado excede o tamanho máximo permitido "
+                f"({header_ct_len} bytes > {MAX_HEADER_LEN} bytes). "
+                "Arquivo possivelmente malformado ou corrompido."
+            )
         header_ct_with_tag = raw[offset:offset + header_ct_len]; offset += header_ct_len
         header_ct  = header_ct_with_tag[:-AUTH_TAG_LEN]
         header_tag = header_ct_with_tag[-AUTH_TAG_LEN:]
