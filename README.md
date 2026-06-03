@@ -173,7 +173,7 @@ df = dd.read("clientes.dlk", key=KEY,
 
 **How it works:** the `.dlk` file stores per-batch statistics (`min`, `max`, `null_count`) in the encrypted header. At read time, batches incompatible with the filter are skipped before building any Python arrays. The entire ciphertext is still decrypted (AES-GCM requires it), but only relevant batches and columns are materialized. For a 1M-row × 50-column DataFrame, reading 2 columns with a 20%-selectivity filter allocates ~16 MB directly instead of 400 MB.
 
-Backward compatible: files written before v1.1.4 (no `row_groups` index in header) fall back to full reads without error.
+Backward compatible: files written before v1.1.5 (no `row_groups` index in header) fall back to full reads without error.
 
 ### Big data — partial reads without OOM
 
@@ -843,9 +843,9 @@ Different `info` fields guarantee DEK ≠ HEK ≠ MAK even from the same master 
 - v3: multiple DataFrames in one file (payload is an in-memory ZIP)
 - v4: no encryption (for already-anonymized data in dev environments)
 
-**v1.1.4+ (format_version 3.0):** multi-batch payload with row group index. Files are fully backward-compatible — older readers ignore the `row_groups` header field.
+**v1.1.5+ (format_version 3.0):** multi-batch payload with row group index. Files are fully backward-compatible — older readers ignore the `row_groups` header field.
 
-**Payload serialization:** Apache Arrow IPC (not Parquet) — 3–5× faster for in-memory round-trips because Arrow IPC maps directly to Arrow's in-memory layout without Parquet's analytical overhead. Starting from v1.1.4, the payload is serialized as a **stream of N independent record batches** (default 50 000 rows each). Per-batch statistics (`min`, `max`, `null_count`) are stored in the encrypted header, enabling predicate pushdown at read time without touching irrelevant batches. Compression (zstd by default) is applied before encryption. Backward-compatible with single-batch IPC and Parquet serialization from older versions via magic marker detection.
+**Payload serialization:** Apache Arrow IPC (not Parquet) — 3–5× faster for in-memory round-trips because Arrow IPC maps directly to Arrow's in-memory layout without Parquet's analytical overhead. Starting from v1.1.5, the payload is serialized as a **stream of N independent record batches** (default 50 000 rows each). Per-batch statistics (`min`, `max`, `null_count`) are stored in the encrypted header, enabling predicate pushdown at read time without touching irrelevant batches. Compression (zstd by default) is applied before encryption. Backward-compatible with single-batch IPC and Parquet serialization from older versions via magic marker detection.
 
 ---
 

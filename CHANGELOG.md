@@ -1,4 +1,4 @@
-## v1.1.4 (2026-06)
+## v1.1.5 (2026-06)
 
 ### Column Pruning e Predicate Pushdown no `.dlk`
 

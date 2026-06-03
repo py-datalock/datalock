@@ -1,5 +1,5 @@
 # Especificação Técnica do Formato `.dlk`
-### datalock v1.1.4 — Referência Completa
+### datalock v1.1.5 — Referência Completa
 
 ---
 
@@ -234,7 +234,7 @@ O payload decifrado é um buffer binário com um magic marker nos primeiros 5 by
 
 **Arrow IPC** (formato atual): serialização binária colunar que mapeia diretamente o layout in-memory do Arrow, 3–5× mais rápido que Parquet para serialização em memória. Compressão interna via `IpcWriteOptions(compression=...)`.
 
-**Multi-batch stream (v1.2.0):** a partir de v1.1.4, o payload Arrow IPC é serializado como um _stream_ de N record batches independentes (padrão: 50 000 linhas por batch) em vez de um único batch monolítico. Isso habilita o índice de row groups no header e o predicate pushdown na leitura — veja §7.1.
+**Multi-batch stream (v1.2.0):** a partir de v1.1.5, o payload Arrow IPC é serializado como um _stream_ de N record batches independentes (padrão: 50 000 linhas por batch) em vez de um único batch monolítico. Isso habilita o índice de row groups no header e o predicate pushdown na leitura — veja §7.1.
 
 **Compressões suportadas:**
 
@@ -258,7 +258,7 @@ O header é um objeto JSON UTF-8, cifrado (v2/v3) ou em claro (v1/v4). Campos co
 |-------------------------|----------|-----------|
 | `format`                | string   | sempre `"lgs"` |
 | `version`               | string   | versão do formato (`"2.1"`, `"3.0"`, `"3.1"`, `"4.0"`) |
-| `format_version`        | string   | versão do formato de serialização do payload (`"3.0"` a partir de v1.1.4) |
+| `format_version`        | string   | versão do formato de serialização do payload (`"3.0"` a partir de v1.1.5) |
 | `content_type`          | string   | tipo do payload (ver abaixo) |
 | `label`                 | string   | rótulo livre para auditoria |
 | `created_at`            | ISO 8601 | timestamp UTC de criação |
@@ -303,7 +303,7 @@ Para `masked_dataframe` e `anonymous_dataframe`: `dtype`, `n_nulls`, `n_unique`,
 
 ### 7.1 Row Group Index (v1.2.0)
 
-A partir de v1.1.4, o campo `"row_groups"` no header cifrado contém um índice dos record batches Arrow IPC que compõem o payload. Isso permite que a biblioteca leia apenas os batches relevantes para uma query, sem materializar o DataFrame inteiro.
+A partir de v1.1.5, o campo `"row_groups"` no header cifrado contém um índice dos record batches Arrow IPC que compõem o payload. Isso permite que a biblioteca leia apenas os batches relevantes para uma query, sem materializar o DataFrame inteiro.
 
 **Estrutura:**
 
@@ -502,7 +502,7 @@ Alinhado com o princípio de limitação de retenção da LGPD (Art. 16) e do GD
 | v3 (0x03)   | ≥ 1.5.0             | ✓ leitura e escrita |
 | v4 (0x04)   | ≥ 1.1.2             | ✓ leitura e escrita |
 
-Arquivos v2/v3 **sem** `"row_groups"` no header (escritos por datalock < 1.1.4) são lidos integralmente sem pruning — degradação graciosa, sem erro. O campo `"format_version": "3.0"` distingue arquivos novos dos antigos.
+Arquivos v2/v3 **sem** `"row_groups"` no header (escritos por datalock < 1.1.5) são lidos integralmente sem pruning — degradação graciosa, sem erro. O campo `"format_version": "3.0"` distingue arquivos novos dos antigos.
 
 Arquivos `.lgs` (formato anterior ao rename) são lidos identicamente via detecção automática.
 

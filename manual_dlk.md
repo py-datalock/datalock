@@ -106,7 +106,7 @@ O cabeçalho JSON é cifrado com a HEK — bloco independente do payload com seu
   "content_type":         "masked_dataframe",
   "label":                "exportacao-crm-jan26",
   "created_at":           "2026-01-15T10:30:00+00:00",
-  "created_by":           "datalock/1.1.3",
+  "created_by":           "datalock/1.1.5",
   "shape":                [100000, 11],
   "schema":               {"cpf": "Utf8", "renda_mensal": "Float64"},
   "column_stats":         {"renda_mensal": {"n_nulls": 0, "n_unique": 8743}},

@@ -1,5 +1,5 @@
 # datalock — Documentação Completa
-### v1.1.4 — Privacy-by-Design para dados tabulares em Python
+### v1.1.5 — Privacy-by-Design para dados tabulares em Python
 
 ---
 
@@ -547,7 +547,7 @@ result = dd.sql("SELECT * FROM df", df=df, salt=SALT)
 
 ## 7. Column Pruning e Predicate Pushdown
 
-A partir de v1.1.4, o formato `.dlk` suporta leitura seletiva de colunas e filtragem de linhas no nível Arrow IPC, sem materializar o DataFrame inteiro em memória.
+A partir de v1.1.5, o formato `.dlk` suporta leitura seletiva de colunas e filtragem de linhas no nível Arrow IPC, sem materializar o DataFrame inteiro em memória.
 
 ### Como funciona
 
@@ -629,7 +629,7 @@ df = SecureFile.load(
 
 ### Retrocompatibilidade
 
-Arquivos gravados por versões anteriores a v1.1.4 (sem `"row_groups"` no header) são lidos normalmente — o pruning é simplesmente desabilitado e todo o payload é materializado como antes. Nenhum erro, nenhuma mudança de comportamento para código existente.
+Arquivos gravados por versões anteriores a v1.1.5 (sem `"row_groups"` no header) são lidos normalmente — o pruning é simplesmente desabilitado e todo o payload é materializado como antes. Nenhum erro, nenhuma mudança de comportamento para código existente.
 
 ### Módulo `datalock.ipc_index`
 
