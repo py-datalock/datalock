@@ -291,7 +291,9 @@ def _read_ipc_partial(
     import pyarrow as pa
     reader = pa.ipc.open_file(str(path))
     n_batches = reader.num_record_batches
-    schema = reader.schema_arrow
+    # BUGFIX: RecordBatchFileReader expõe `.schema` (não `.schema_arrow` —
+    # esse atributo existe em pyarrow.parquet.ParquetFile, não no reader IPC).
+    schema = reader.schema
 
     if header_only:
         return {
@@ -895,6 +897,58 @@ class DatabaseConnection:
         from datalock.adapters.db_adapter import SecureDBAdapter
         adapter = SecureDBAdapter(engine=self._get_engine(), salt=effective_salt or "x")
         return adapter.upsert(df_pd, table, on=on, schema=schema)
+
+    # ── DBA: DDL/DML genérico, transações, índices ───────────────────────────
+
+    def execute(self, sql: str, params: Optional[Any] = None) -> int:
+        """
+        Executa DDL/DML arbitrário (CREATE, ALTER, DROP, INSERT, UPDATE,
+        DELETE, CREATE INDEX...) — uso de DBA, sem passar pelo caminho de
+        leitura/mascaramento de query()/read().
+
+        Exemplo:
+            banco.execute("CREATE INDEX idx_cpf ON clientes (cpf)")
+            banco.execute("DELETE FROM clientes WHERE uf = :uf", {"uf": "XX"})
+        """
+        from sqlalchemy import text as _sql_text
+        engine = self._get_engine()
+        try:
+            with engine.begin() as conn:
+                result = conn.execute(_sql_text(sql), params or {})
+                try:
+                    return result.rowcount if result.rowcount is not None else 0
+                except Exception:
+                    return 0
+        except Exception as exc:
+            raise RuntimeError(f"Erro ao executar SQL: {type(exc).__name__}: {exc}") from None
+
+    def transaction(self):
+        """
+        Context manager de transação — agrupa múltiplos execute() em uma
+        única transação atômica (commit ao final, rollback se exceção).
+
+        Exemplo:
+            with banco.transaction() as tx:
+                tx.execute("UPDATE contas SET saldo = saldo - :v WHERE id = :o", {"v": 100, "o": 1})
+                tx.execute("UPDATE contas SET saldo = saldo + :v WHERE id = :d", {"v": 100, "d": 2})
+        """
+        from datalock.adapters.db_adapter import _DBTransaction
+        return _DBTransaction(self._get_engine())
+
+    def drop_table(self, table: str, *, if_exists: bool = True) -> None:
+        """Remove uma tabela. if_exists=True evita erro se ela não existir."""
+        clause = "IF EXISTS " if if_exists else ""
+        self.execute(f"DROP TABLE {clause}{table}")
+
+    def create_index(
+        self, table: str, columns: Union[str, List[str]], *,
+        name: Optional[str] = None, unique: bool = False,
+    ) -> None:
+        """Cria um índice em uma ou mais colunas de uma tabela existente."""
+        cols = [columns] if isinstance(columns, str) else list(columns)
+        idx_name = name or f"idx_{table}_{'_'.join(cols)}"
+        uniq = "UNIQUE " if unique else ""
+        self.execute(f"CREATE {uniq}INDEX {idx_name} ON {table} ({', '.join(cols)})")
 
     # ── Internos ───────────────────────────────────────────────────────────
 

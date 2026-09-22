@@ -529,10 +529,40 @@ class _PolarsNativeMasker:
         if strategy == MaskStrategy.MOCK_NUM:
             return self._mock_num_expr(df, col, report)
 
+        if strategy == MaskStrategy.ENCRYPT:
+            return self._encrypt_expr_eager(col)
+
         if strategy == MaskStrategy.PASSTHROUGH:
             return None
 
         return None
+
+    def _reversible_cipher(self, associated_data: Optional[str] = None):
+        """Instancia (ou reaproveita) o ReversibleCipher para strategy=ENCRYPT."""
+        from datalock.maskers.reversible import ReversibleCipher
+        cache = getattr(self, "_reversible_ciphers", None)
+        if cache is None:
+            cache = {}
+            self._reversible_ciphers = cache
+        key = associated_data or ""
+        if key not in cache:
+            salt = self._salt_bytes.decode("utf-8", errors="surrogateescape")
+            cache[key] = ReversibleCipher(salt=salt, associated_data=associated_data)
+        return cache[key]
+
+    def _encrypt_expr_eager(self, col: str) -> "pl.Expr":
+        """
+        MaskStrategy.ENCRYPT — pseudonimização reversível (AES-SIV).
+
+        associated_data=col amarra cada token ao nome da coluna: um valor
+        idêntico em duas colunas diferentes ("cpf_titular" e "cpf_conjuge")
+        gera tokens distintos, e um token "movido" de uma coluna para outra
+        falha a autenticação em vez de decifrar silenciosamente errado.
+        """
+        cipher = self._reversible_cipher(associated_data=col)
+        return pl.col(col).map_elements(
+            cipher.encrypt_value, return_dtype=pl.String
+        ).alias(col)
 
     # Strings que devem ser tratadas como null (consistente com hashing.py)
     _NULL_STR = frozenset({"", "nan", "none", "null", "na", "n/a", "<na>"})
@@ -728,6 +758,9 @@ class _PolarsNativeMasker:
         if strategy == MaskStrategy.MOCK_NUM:
             # Vectorised in eager path; lazy has no frame length → fall through
             return None
+
+        if strategy == MaskStrategy.ENCRYPT:
+            return self._encrypt_expr_eager(col)
 
         return None
 

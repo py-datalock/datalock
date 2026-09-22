@@ -48,6 +48,7 @@ from datalock.utils.salt import generate_salt, generate_salt_hex
 from datalock.analytics import write as _analytics_write
 from datalock.secure_file import SecureFile
 from datalock.adapters.pandas_adapter import IdempotencyError
+from datalock.frame_proxy import frame, FrameProxy
 
 # dd.col = pl.col — acesso a todos os métodos nativos Polars (rank, over, str.*, dt.*, etc.)
 # dd.when, dd.lit, dd.concat_str também são wrappers Polars nativos
@@ -189,6 +190,8 @@ __all__ = [
     # Novas features v1.1.0
     "validate", "expect", "mask_sql", "generate_view",
     "lineage", "ValidationReport",
+    # Reversibilidade (pseudonimização) e proxy genérico Polars
+    "unmask", "frame", "FrameProxy", "execute",
 ]
 
 
@@ -269,6 +272,8 @@ def mask(
     columns: Optional[List[str]] = None,
     exclude: Optional[List[str]] = None,
     risk: Optional[str] = None,
+    strategy: Optional[Union[str, Dict[str, str]]] = None,
+    rows: Optional[Any] = None,
 ) -> Union[pd.DataFrame, pl.DataFrame]:
     """
     Aplica mascaramento PII. Engine Polars internamente — vetorizado e rápido.
@@ -283,6 +288,8 @@ def mask(
         verbose:      Imprime relatório de detecção PII.
         columns:      Mascara apenas estas colunas (None = todas PII detectadas).
         exclude:      Não mascara estas colunas.
+        strategy:     Define/força o método manualmente (ver seção "strategy" abaixo).
+        rows:         Mascara só um subconjunto de linhas (ver seção "rows" abaixo).
 
     Returns:
         DataFrame mascarado, mesmo tipo do input.
@@ -294,12 +301,33 @@ def mask(
     Normalização:
         CPF: "111.444.777-35", "11144477735", "111-444-777.35" → mesmo token.
 
-    risk:
-        Mascaramento risk-aware — aplica estratégia por nível de risco sem precisar
-        especificar colunas explicitamente:
-          'high'   → suprime (null) identificadores de alto risco
-          'medium' → hash para risco médio, truncate/redact para baixo
-          'low'    → truncate/generalize — preserva utilidade
+    strategy:
+        Escolhe o método de mascaramento manualmente, em vez do detectado
+        automaticamente pelo scanner de PII. Aceita:
+          - str:  aplica esta estratégia a TODAS as colunas de `columns=`.
+                  Ex.: dd.mask(df, salt=SALT, columns=["obs"], strategy="redact")
+          - dict: {"coluna": "estrategia"} — por coluna. Colunas citadas aqui
+                  são mascaradas mesmo que NÃO sejam PII (texto livre, notas,
+                  qualquer campo), e mesmo que não estejam em `columns=`.
+                  Ex.: dd.mask(df, salt=SALT,
+                               strategy={"cpf": "encrypt", "renda": "mock_numeric",
+                                         "observacao_livre": "redact"})
+        Estratégias disponíveis: "hash" (irreversível, padrão PII),
+        "encrypt" (REVERSÍVEL — ver dd.unmask()), "truncate", "redact",
+        "suppress" (vira null), "mock_numeric", "mock_category",
+        "generalize_date", "mask_phone_ddd", "passthrough" (não altera).
+
+    rows:
+        Restringe o mascaramento a um subconjunto de linhas; as demais
+        mantêm o valor original na mesma coluna. Aceita:
+          - pl.Expr:                dd.mask(df, salt=SALT, columns=["renda"],
+                                             rows=dd.col("uf") == "SP")
+          - lista/array de bool:    rows=[True, False, True, ...]
+          - callable(df) -> Expr:   rows=lambda d: d["idade"] < 18
+        Observação: se a máscara produz um tipo diferente do original
+        (comum em hash/encrypt sobre colunas numéricas), a coluna final
+        vira string — não há como uma coluna ser int nas linhas não
+        mascaradas e string nas mascaradas ao mesmo tempo.
 
     Exemplos:
         df_safe = dd.mask(df, salt=SALT)
@@ -307,6 +335,8 @@ def mask(
         df_safe = dd.mask(df, salt=SALT, exclude=["uf", "tipo_pessoa"])
         df_pl_safe = dd.mask(df_pl, salt=SALT)   # retorna pl.DataFrame
         df_safe = dd.mask(df, salt=SALT, risk="high")   # suprime alto risco
+        df_safe = dd.mask(df, salt=SALT, strategy={"cpf": "encrypt"})
+        df_safe = dd.mask(df, salt=SALT, columns=["renda"], rows=dd.col("uf") == "SP")
     """
     if not salt:
         # Verifica DEFAULT_SALT configurado via dd.configure(default_salt=...)
@@ -323,6 +353,32 @@ def mask(
                 stacklevel=2,
             )
             salt = _sec.token_hex(32)
+
+    # strategy=/rows= têm precedência sobre risk= (são mutuamente exclusivos
+    # em intenção: risk= é um atalho automático, strategy=/rows= é controle fino).
+    if (strategy is not None or rows is not None) and risk is not None:
+        raise ValueError(
+            "dd.mask(): não combine risk= com strategy=/rows= — risk= já escolhe "
+            "a estratégia automaticamente por nível de risco. Use um ou outro."
+        )
+
+    if strategy is not None or rows is not None:
+        if isinstance(df, pl.LazyFrame):
+            raise TypeError(
+                "dd.mask(strategy=/rows=...) ainda não suporta pl.LazyFrame — "
+                "faça .collect() antes de chamar mask() com estes parâmetros."
+            )
+        return _core.mask_frame(
+            df,
+            salt=salt,
+            random_state=random_state,
+            strict_idempotency=strict,
+            verbose=verbose,
+            columns=columns,
+            exclude=exclude,
+            strategy=strategy,
+            rows=rows,
+        )
 
     # Risk-aware masking: sobrepõe estratégia por nível de risco
     if risk is not None:
@@ -389,6 +445,85 @@ def mask(
         columns=columns,
         exclude=exclude,
     )
+
+
+# ---------------------------------------------------------------------------
+# unmask() — reverte colunas mascaradas com strategy="encrypt"
+# ---------------------------------------------------------------------------
+
+def unmask(
+    df: Union[pd.DataFrame, pl.DataFrame],
+    *,
+    salt: str,
+    columns: Optional[List[str]] = None,
+) -> Union[pd.DataFrame, pl.DataFrame]:
+    """
+    Reverte colunas mascaradas com dd.mask(..., strategy="encrypt"/{"col":"encrypt"})
+    de volta ao valor original. Requer o MESMO salt usado para mascarar.
+
+    IMPORTANTE — só funciona para colunas cifradas com strategy="encrypt"
+    (pseudonimização reversível via AES-SIV). Colunas mascaradas com "hash"
+    (o padrão de dd.mask()) são IRREVERSÍVEIS por design — não existe
+    "unhash". Chamar unmask() numa coluna hash levanta ValueError explicando
+    isso, em vez de retornar lixo silenciosamente.
+
+    Args:
+        df:      DataFrame contendo colunas cifradas com strategy="encrypt".
+        salt:    O MESMO salt usado em dd.mask(df, salt=salt, strategy=...).
+        columns: Colunas a reverter. Se None, tenta reverter todas as
+                 colunas que parecem conter tokens 'enc:...'.
+
+    Returns:
+        DataFrame com as colunas revertidas ao valor original, mesmo tipo
+        de entrada (pd.DataFrame → pd.DataFrame, pl.DataFrame → pl.DataFrame).
+
+    Exemplos:
+        df_safe = dd.mask(df, salt=SALT, strategy={"cpf": "encrypt"})
+        ... # df_safe pode ser armazenado, compartilhado internamente, etc.
+        df_original = dd.unmask(df_safe, salt=SALT, columns=["cpf"])
+        assert df_original["cpf"].to_list() == df["cpf"].to_list()
+    """
+    from datalock.maskers.reversible import ReversibleCipher, is_reversible_token
+
+    was_pandas = isinstance(df, pd.DataFrame)
+    df_pl = df if isinstance(df, pl.DataFrame) else pl.from_pandas(df)
+
+    if columns is None:
+        columns = [
+            c for c in df_pl.columns
+            if df_pl[c].dtype == pl.String
+            and df_pl[c].drop_nulls().head(20).map_elements(
+                is_reversible_token, return_dtype=pl.Boolean
+            ).fill_null(False).any()
+        ]
+        if not columns:
+            raise ValueError(
+                "dd.unmask(): nenhuma coluna com tokens 'enc:...' foi encontrada "
+                "automaticamente. Informe columns=[...] explicitamente."
+            )
+
+    exprs = []
+    for col in columns:
+        if col not in df_pl.columns:
+            raise ValueError(f"dd.unmask(): coluna '{col}' não existe no DataFrame.")
+        cipher = ReversibleCipher(salt=salt, associated_data=col)
+
+        def _decrypt_one(v, _cipher=cipher, _col=col):
+            if v is None:
+                return None
+            try:
+                return _cipher.decrypt_value(v)
+            except ValueError as exc:
+                raise ValueError(
+                    f"dd.unmask(): falha ao reverter a coluna '{_col}': {exc}"
+                ) from exc
+
+        exprs.append(
+            pl.col(col).map_elements(_decrypt_one, return_dtype=pl.String).alias(col)
+        )
+
+    result = df_pl.with_columns(exprs)
+    return result.to_pandas() if was_pandas else result
 
 
 # ---------------------------------------------------------------------------
@@ -497,7 +632,9 @@ def read(
         if not p.exists():
             raise FileNotFoundError(f"Arquivo não encontrado: {source}")
         if key is None:
-            return SecureFile.load_open(p)
+            # v4 sem criptografia — single-frame (pd/pl.DataFrame) ou
+            # multi-frame (dict[str, DataFrame] se frame= não informado).
+            return SecureFile.load_open(p, frame=frame, verbose=verbose)
 
         content_type = _peek_lgs_content_type(p, key)
 
@@ -623,9 +760,20 @@ def store(
     # Arquivo sem criptografia (v4/open)
     if key is None:
         if isinstance(source, dict):
-            raise TypeError(
-                "store() multi-frame requer key=. "
-                "Arquivos sem criptografia não suportam multi-frame."
+            # Multi-frame SEM criptografia — "zip de parquets" com várias
+            # tabelas em um único arquivo .dlk, sem exigir key= nem salt=.
+            _validate_frames_dict(source)
+            if not anonymize:
+                for _name, _f in source.items():
+                    _warn_if_pii(_f)
+            else:
+                source = {
+                    k: (mask(v, salt=salt) if salt else mask(v))
+                    for k, v in source.items()
+                }
+            return SecureFile.pack_open_frames(
+                source, out, label=label, compress=compress,
+                overwrite=overwrite, metadata=metadata,
             )
         if not isinstance(source, pd.DataFrame):
             raise TypeError(
@@ -796,6 +944,42 @@ def write(
         return path_or_conn.write(df, table, **kw)
     # Arquivo — delega para analytics.write
     _analytics_write(df, str(path_or_conn), **kw)
+
+
+# ---------------------------------------------------------------------------
+# execute() — DDL/DML genérico num DatabaseConnection (dd.db())
+# ---------------------------------------------------------------------------
+
+def execute(banco: "DatabaseConnection", sql: str, params: Optional[Any] = None) -> int:
+    """
+    Executa DDL/DML arbitrário em uma conexão dd.db() — CREATE, ALTER, DROP,
+    INSERT, UPDATE, DELETE, CREATE INDEX, etc. Uso típico de DBA: quando o
+    objetivo não é ler um result set (isso é dd.read(banco, sql)), e sim
+    alterar o banco.
+
+    Args:
+        banco:  Conexão criada via dd.db(uri).
+        sql:    Instrução SQL (DDL ou DML).
+        params: Parâmetros vinculados (dict), se houver.
+
+    Returns:
+        Número de linhas afetadas (0 para DDL sem contagem aplicável).
+
+    Exemplos:
+        dd.execute(banco, "CREATE INDEX idx_cpf ON clientes (cpf)")
+        dd.execute(banco, "DELETE FROM clientes WHERE uf = :uf", {"uf": "XX"})
+
+        with banco.transaction() as tx:
+            tx.execute("UPDATE contas SET saldo = saldo - :v WHERE id = :o", {"v": 100, "o": 1})
+            tx.execute("UPDATE contas SET saldo = saldo + :v WHERE id = :d", {"v": 100, "d": 2})
+    """
+    if not isinstance(banco, DatabaseConnection):
+        raise TypeError(
+            f"dd.execute() requer uma conexão dd.db(...) como primeiro argumento "
+            f"(recebido {type(banco).__name__})."
+        )
+    return banco.execute(sql, params)
+
 
 # ---------------------------------------------------------------------------
 # stream() — leitura em chunks sem OOM

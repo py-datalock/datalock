@@ -251,6 +251,8 @@ def mask_frame(
     strict_idempotency: bool = True,
     verbose: bool = False,
     detector_kwargs: Optional[Dict] = None,
+    strategy: Optional[Any] = None,
+    rows: Optional[Any] = None,
 ) -> Any:
     """
     Mascara PII com engine Polars internamente.
@@ -262,6 +264,26 @@ def mask_frame(
       2. Detecta PII via PIIDetector (amostra — 50-100× mais rápido)
       3. Aplica mascaramento vetorizado (PolarsNativeMasker)
       4. Converte de volta para pd.DataFrame (se entrada era pandas)
+
+    strategy:
+        Define/força o método de mascaramento manualmente, ao invés do
+        detectado automaticamente. Aceita:
+          - str: aplica esta estratégia a TODAS as colunas em `columns`
+                 (obrigatório informar `columns` junto de strategy=str).
+          - dict[str, str]: {"coluna": "estrategia"} — por coluna, e pode
+                 incluir colunas que NÃO seriam detectadas como PII
+                 (ex.: mascarar um campo de texto livre com "redact", ou
+                 uma coluna qualquer com "encrypt").
+        Estratégias válidas: "hash", "encrypt" (reversível — ver dd.unmask()),
+        "truncate", "redact", "suppress", "mock_numeric", "mock_category",
+        "generalize_date", "mask_phone_ddd", "passthrough".
+
+    rows:
+        Restringe o mascaramento a um subconjunto de linhas — as demais
+        linhas mantêm o valor original. Aceita:
+          - pl.Expr (ex.: pl.col("uf") == "SP")
+          - lista/array/Series de booleanos (mesmo comprimento do DataFrame)
+          - callable(df) -> pl.Expr | array de booleanos
     """
     import pandas as _pd
 
@@ -282,9 +304,140 @@ def mask_frame(
         verbose=verbose,
         detector_kwargs=detector_kwargs,
         audit=active_audit,
+        strategy=strategy,
+        rows=rows,
     )
 
     return result_pl.to_pandas() if was_pandas else result_pl
+
+
+def _resolve_row_mask(df: pl.DataFrame, rows: Any) -> pl.Series:
+    """
+    Normaliza `rows` (pl.Expr | lista/array bool | callable) em pl.Series bool
+    alinhada ao DataFrame. Levanta ValueError se o comprimento não bater.
+    """
+    if callable(rows) and not isinstance(rows, pl.Expr):
+        rows = rows(df)
+
+    if isinstance(rows, pl.Expr):
+        mask_series = df.select(rows.alias("__dd_row_mask__"))["__dd_row_mask__"]
+    elif isinstance(rows, pl.Series):
+        mask_series = rows
+    else:
+        mask_series = pl.Series("__dd_row_mask__", list(rows))
+
+    if mask_series.dtype != pl.Boolean:
+        mask_series = mask_series.cast(pl.Boolean)
+    if len(mask_series) != df.height:
+        raise ValueError(
+            f"mask(rows=...): comprimento ({len(mask_series)}) diferente do "
+            f"número de linhas do DataFrame ({df.height})."
+        )
+    return mask_series.fill_null(False)
+
+
+def _apply_row_mask(
+    df_original: pl.DataFrame,
+    df_masked: pl.DataFrame,
+    reports: Dict[str, Any],
+    row_mask: pl.Series,
+) -> pl.DataFrame:
+    """
+    Combina df_original e df_masked linha a linha: onde row_mask é True usa
+    o valor mascarado, caso contrário mantém o valor original.
+
+    Quando o tipo resultante da máscara difere do tipo original (comum em
+    HASH/ENCRYPT, que geram string a partir de qualquer tipo de entrada),
+    ambos os lados são convertidos para String antes do `when/then/otherwise`
+    — a coluna final fica como String nesse caso. Isso é inevitável: uma
+    coluna não pode ser simultaneamente int (linhas não mascaradas) e string
+    (linhas mascaradas).
+    """
+    exprs = []
+    mask_expr = pl.lit(row_mask)
+    for col in reports:
+        if col not in df_masked.columns or col not in df_original.columns:
+            continue
+        orig_dtype = df_original[col].dtype
+        masked_dtype = df_masked[col].dtype
+        if orig_dtype == masked_dtype:
+            expr = (
+                pl.when(mask_expr)
+                .then(df_masked[col])
+                .otherwise(df_original[col])
+                .alias(col)
+            )
+        else:
+            expr = (
+                pl.when(mask_expr)
+                .then(df_masked[col].cast(pl.String))
+                .otherwise(df_original[col].cast(pl.String))
+                .alias(col)
+            )
+        exprs.append(expr)
+    return df_original.with_columns(exprs) if exprs else df_original.clone()
+
+
+def _build_strategy_overrides(
+    df: pl.DataFrame,
+    reports: Dict[str, "Any"],
+    strategy: Any,
+    columns: Optional[List[str]],
+) -> Dict[str, "Any"]:
+    """
+    Aplica overrides de `strategy=` sobre `reports` (detectados), criando
+    ColumnReport sintético para colunas fora da detecção automática — é
+    isso que permite mascarar QUALQUER coluna com QUALQUER método, não só
+    as reconhecidas como PII.
+    """
+    from datalock.detectors.pii_detector import (
+        ColumnReport, MaskStrategy, PIIType, RiskLevel,
+    )
+
+    reports = dict(reports)
+
+    def _to_strategy(s: Any) -> "MaskStrategy":
+        if isinstance(s, MaskStrategy):
+            return s
+        try:
+            return MaskStrategy(str(s).lower().strip())
+        except ValueError:
+            valid = ", ".join(m.value for m in MaskStrategy)
+            raise ValueError(
+                f"strategy={s!r} inválida. Valores aceitos: {valid}."
+            ) from None
+
+    if isinstance(strategy, str):
+        if not columns:
+            raise ValueError(
+                "mask(strategy='...') como string requer columns=[...] "
+                "explícito (não há como saber quais colunas mascarar). "
+                "Use strategy={'coluna': 'estrategia'} para não precisar "
+                "de columns=."
+            )
+        strategy_map = {c: strategy for c in columns}
+    elif isinstance(strategy, dict):
+        strategy_map = strategy
+    else:
+        raise TypeError(
+            f"strategy= deve ser str ou dict[str, str], recebeu {type(strategy).__name__}."
+        )
+
+    for col, strat in strategy_map.items():
+        if col not in df.columns:
+            raise ValueError(f"mask(strategy=...): coluna '{col}' não existe no DataFrame.")
+        ms = _to_strategy(strat)
+        existing = reports.get(col)
+        reports[col] = ColumnReport(
+            column=col,
+            pii_type=existing.pii_type if existing else PIIType.UNKNOWN,
+            risk_level=existing.risk_level if existing else RiskLevel.MEDIUM,
+            mask_strategy=ms,
+            match_ratio=existing.match_ratio if existing else 1.0,
+            unique_ratio=existing.unique_ratio if existing else 1.0,
+            notes="strategy= explícito (override manual via dd.mask)",
+        )
+    return reports
 
 
 def _mask_polars(
@@ -298,6 +451,8 @@ def _mask_polars(
     verbose: bool,
     detector_kwargs: Optional[Dict],
     audit: Optional[Any] = None,
+    strategy: Optional[Any] = None,
+    rows: Optional[Any] = None,
 ) -> pl.DataFrame:
     """Mascaramento completo em Polars nativo."""
     from datalock.detectors.pii_detector import PIIDetector
@@ -313,6 +468,15 @@ def _mask_polars(
     else:
         reports = FastPIIScanner(sample_size=500).detect_dict(df)
 
+    # strategy= permite mascarar colunas fora da detecção automática (não-PII
+    # inclusive) e/ou forçar um método específico numa coluna já detectada.
+    # Colunas citadas explicitamente em strategy= sempre são mascaradas,
+    # mesmo que não estejam em columns= (que só filtra a detecção automática).
+    explicit_cols: set = set()
+    if strategy is not None:
+        reports = _build_strategy_overrides(df, reports, strategy, columns)
+        explicit_cols = set(strategy.keys()) if isinstance(strategy, dict) else set(columns or [])
+
     if not reports:
         logger.info("mask_frame: nenhum PII detectado — DataFrame retornado sem alteração.")
         warnings.warn(
@@ -323,11 +487,11 @@ def _mask_polars(
         )
         return df.clone()
 
-    # Filtro de colunas
+    # Filtro de colunas (preserva sempre as citadas explicitamente em strategy=)
     if columns is not None:
-        reports = {k: v for k, v in reports.items() if k in columns}
+        reports = {k: v for k, v in reports.items() if k in columns or k in explicit_cols}
     if exclude is not None:
-        reports = {k: v for k, v in reports.items() if k not in exclude}
+        reports = {k: v for k, v in reports.items() if k not in exclude or k in explicit_cols}
     if not reports:
         return df.clone()
 
@@ -359,6 +523,11 @@ def _mask_polars(
 
     masker = _PolarsNativeMasker(salt=salt, random_state=random_state)
     result = masker.apply_eager(df, reports)
+
+    # rows= restringe o mascaramento a um subconjunto de linhas — combina o
+    # DataFrame mascarado com o original linha a linha conforme a máscara.
+    if rows is not None:
+        result = _apply_row_mask(df, result, reports, _resolve_row_mask(df, rows))
 
     # Trilha de auditoria (LGPD Art. 50)
     if audit is not None:

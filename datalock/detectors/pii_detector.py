@@ -78,6 +78,11 @@ class MaskStrategy(str, Enum):
     PASSTHROUGH     = "passthrough"
     MASK_PHONE_DDD  = "mask_phone_ddd"
     GENERALIZE_DATE = "generalize_date"
+    ENCRYPT         = "encrypt"  # pseudonimização REVERSÍVEL (AES-SIV) — ver maskers/reversible.py.
+                                 # Diferente das demais (irreversíveis por design), ENCRYPT permite
+                                 # dd.unmask() reverter ao valor original para quem possui o salt.
+                                 # Nunca é escolhida automaticamente pelo detector — só via
+                                 # dd.mask(..., strategy="encrypt"/{"col": "encrypt"}).
 
 
 # ---------------------------------------------------------------------------

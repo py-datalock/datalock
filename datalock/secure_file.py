@@ -401,11 +401,16 @@ def _bytes_to_df(
     relevant_batches = prune_row_groups(row_groups_meta, filters)
     use_pruning = relevant_batches != {ALL_BATCHES_SENTINEL}
 
-    batches = []
-    n_batches = reader.num_record_batches
+    # BUGFIX: RecordBatchStreamReader (ipc.open_stream) não expõe
+    # .num_record_batches nem .get_batch(i) — essa API pertence ao
+    # RecordBatchFileReader (formato "file", usado com ipc.open_file()).
+    # O reader de stream é iterável e cada iteração já devolve um
+    # pa.RecordBatch, na ordem em que foram escritos.
+    reader_schema = reader.schema
+    all_batches = list(reader)
 
-    for i in range(n_batches):
-        batch = reader.get_batch(i)
+    batches = []
+    for i, batch in enumerate(all_batches):
 
         # Row group pruning: pula batches irrelevantes
         if use_pruning and i not in relevant_batches:
@@ -429,7 +434,7 @@ def _bytes_to_df(
 
     if not batches:
         # Nenhum batch passou os filtros — retorna DataFrame vazio com schema correto
-        schema = reader.schema_arrow
+        schema = reader_schema
         if columns:
             available = [c for c in columns if c in schema.names]
             if available:
@@ -1341,7 +1346,11 @@ class SecureFile:
             df = _secure(df, salt=salt_masking)
             content_type = SecureFile.CONTENT_TYPE_ANON
         else:
-            content_type = SecureFile.CONTENT_TYPE_ANON
+            # BUGFIX: antes marcava CONTENT_TYPE_ANON mesmo sem mascarar nada.
+            # Sem anonymize=True, os dados são gravados exatamente como vieram
+            # (uso como "parquet melhorado" — ver pedido de generalização),
+            # então o content_type correto é RAW, não ANON.
+            content_type = SecureFile.CONTENT_TYPE_RAW
 
         parquet_comp = "zstd" if compress else "lz4"
         plaintext_bytes, _rg_meta = _df_to_bytes(
@@ -1388,6 +1397,106 @@ class SecureFile:
         }
 
     @classmethod
+    def pack_open_frames(
+        cls,
+        frames: Dict[str, pd.DataFrame],
+        output_path: Union[str, Path],
+        *,
+        label: str = "",
+        compress: bool = True,
+        overwrite: bool = False,
+        metadata: Optional[Dict[str, Any]] = None,
+    ) -> Dict[str, Any]:
+        """
+        Empacota MÚLTIPLOS DataFrames em um .dlk v4 **sem criptografia**.
+
+        Equivalente sem-chave de pack_frames() (v3): mesmo mecanismo interno
+        (ZIP em memória de Parquets + índice JSON), mas sem nenhuma camada
+        de cifra — é o modo "parquet melhorado" pedido para múltiplas
+        tabelas: um único arquivo portátil guardando várias tabelas, com
+        metadados/schema/integridade básica, sem exigir key= nem salt=.
+
+        Segurança: idêntica a pack_open() — sem key, o FILE_HMAC usa uma
+        chave pública fixa (detecta corrupção acidental, não adulteração
+        intencional). Use apenas para dados que já não contenham PII, ou
+        que serão anonimizados manualmente depois (dd.mask() column a
+        column, ou dd.read(..., frame=...) + dd.mask() sob demanda).
+
+        Args:
+            frames:      Dict[nome → DataFrame]. Ordem preservada.
+            output_path: Caminho do .dlk de saída.
+            label:       Rótulo livre para auditoria.
+            compress:    True → Parquet/zstd; False → Parquet/lz4.
+            overwrite:   Sobrescreve arquivo existente.
+            metadata:    Dict de metadados arbitrários {str: str}.
+
+        Returns:
+            Dict com metadados: n_frames, nomes, shape total, tamanho, elapsed.
+
+        Exemplo:
+            SecureFile.pack_open_frames(
+                {"clientes": df1, "pedidos": df2, "produtos": df3},
+                "base_dev.dlk",
+            )
+            frames = SecureFile.load_open("base_dev.dlk")  # -> dict[str, pd.DataFrame]
+        """
+        output = Path(output_path)
+        _check_output(output, overwrite)
+
+        if not isinstance(frames, dict) or not frames:
+            raise ValueError("frames deve ser um dict não-vazio de {str: DataFrame}.")
+
+        t0 = time.perf_counter()
+        parquet_comp = "zstd" if compress else "lz4"
+        zip_bytes, index = _frames_to_zip_bytes(frames, parquet_compression=parquet_comp)
+
+        total_rows = sum(e["rows"] for e in index)
+        total_cols = sum(e["cols"] for e in index)
+
+        header = {
+            "format":               "lgs",
+            "version":              "4.0",
+            "content_type":         SecureFile.CONTENT_TYPE_MULTI,
+            "encrypted":            False,
+            "label":                label,
+            "created_at":           datetime.now(timezone.utc).isoformat(),
+            "created_by":           f"datalock/{_logus_version()}",
+            "n_frames":             len(frames),
+            "frame_names":          [e["name"] for e in index],
+            "frame_index":          index,
+            "masking_applied":      False,
+            "compression":          f"ipc_{parquet_comp}",
+            "kdf":                  "none",
+            "encryption":           "none",
+            "integrity":            "HMAC-SHA256 (public key — tamper detection only)",
+            "plaintext_size_bytes": len(zip_bytes),
+            "metadata":             metadata or {},
+        }
+
+        body = _pack_v4_body(header, zip_bytes)
+        _write_lgs(output, body, None)
+
+        elapsed = time.perf_counter() - t0
+        packed_size = output.stat().st_size
+        logger.info(
+            "SecureFile.pack_open_frames | n_frames=%d | names=%s | encrypted=False | %.3fs",
+            len(frames), list(frames.keys()), elapsed,
+        )
+        return {
+            "output_path":       str(output),
+            "content_type":      SecureFile.CONTENT_TYPE_MULTI,
+            "encrypted":         False,
+            "n_frames":          len(frames),
+            "frame_names":       [e["name"] for e in index],
+            "total_rows":        total_rows,
+            "total_cols":        total_cols,
+            "original_size_kb":  round(len(zip_bytes) / 1024, 1),
+            "packed_size_kb":    round(packed_size / 1024, 1),
+            "compression_ratio": round(len(zip_bytes) / max(packed_size, 1), 3),
+            "elapsed_seconds":   round(elapsed, 3),
+        }
+
+    @classmethod
     def load_open(
         cls,
         path: Union[str, Path],
@@ -1395,21 +1504,28 @@ class SecureFile:
         anonymize: bool = False,
         salt_masking: Optional[str] = None,
         verbose: bool = False,
-    ) -> pd.DataFrame:
+        frame: Optional[str] = None,
+    ) -> Union[pd.DataFrame, Dict[str, pd.DataFrame]]:
         """
-        Lê um arquivo .dlk sem criptografia (v4 / pack_open).
+        Lê um arquivo .dlk sem criptografia (v4 / pack_open / pack_open_frames).
 
         Também funciona para arquivos v1/v2/v3 que não precisem de key
         na chamada — mas nesses casos a key é obrigatória e o erro é claro.
 
         Args:
             path:          Caminho para o arquivo `.dlk`.
-            apply_masking: Se True, aplica mascaramento PII na leitura.
-            salt_masking:  Salt para mascaramento.
+            anonymize:     Se True, aplica mascaramento PII na leitura
+                           (ignorado para arquivos multi-frame — mascare
+                           cada frame manualmente com dd.mask() depois).
+            salt_masking:  Salt para mascaramento (usado só com anonymize=True).
             verbose:       Exibe relatório de detecção PII.
+            frame:         Para arquivos multi-frame (pack_open_frames):
+                           nome do frame a extrair. Se None, retorna todos
+                           os frames como dict[str, pd.DataFrame].
 
         Returns:
-            DataFrame com o conteúdo decifrado.
+            pd.DataFrame (single-frame ou frame= escolhido), ou
+            dict[str, pd.DataFrame] (multi-frame sem frame= especificado).
 
         Raises:
             ValueError: Se o arquivo estiver criptografado (use load() com key=).
@@ -1453,11 +1569,30 @@ class SecureFile:
         payload_bytes = body[offset:]
 
         content_type = header.get("content_type", SecureFile.CONTENT_TYPE_ANON)
+
+        # ── Multi-frame (pack_open_frames) — "zip de parquets" sem key ──────
         if content_type == SecureFile.CONTENT_TYPE_MULTI:
-            raise TypeError(
-                f"'{p.name}' é um arquivo multi-frame. "
-                f"Use SecureFile.load_frames() para ler todos os frames."
-            )
+            frames = _zip_bytes_to_frames(payload_bytes)
+            if anonymize:
+                import warnings as _w
+                _w.warn(
+                    "load_open(anonymize=True) não tem efeito em arquivos "
+                    "multi-frame — mascare cada frame individualmente com "
+                    "dd.mask(frames['nome'], salt=...) após a leitura.",
+                    UserWarning, stacklevel=2,
+                )
+            if frame is not None:
+                if frame not in frames:
+                    raise KeyError(
+                        f"Frame '{frame}' não encontrado. Disponíveis: "
+                        f"{list(frames.keys())}"
+                    )
+                logger.info("SecureFile.load_open | %s | frame=%s | shape=%s",
+                            p.name, frame, frames[frame].shape)
+                return frames[frame]
+            logger.info("SecureFile.load_open | %s | multi-frame | n_frames=%d",
+                        p.name, len(frames))
+            return frames
 
         df = _bytes_to_df(payload_bytes)
 

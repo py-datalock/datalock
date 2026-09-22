@@ -46,6 +46,36 @@ logger = logging.getLogger(__name__)
 
 Dialect = Literal["postgresql", "mysql", "sqlite", "sqlserver", "oracle", "bigquery"]
 
+
+class _DBTransaction:
+    """
+    Objeto de transação retornado por SecureDBAdapter.transaction().
+
+    Commit automático ao sair do `with` sem exceção; rollback automático
+    se qualquer exceção for levantada dentro do bloco.
+    """
+
+    def __init__(self, engine: Any):
+        self._engine = engine
+        self._conn = None
+        self._ctx = None
+
+    def __enter__(self) -> "_DBTransaction":
+        self._ctx = self._engine.begin()
+        self._conn = self._ctx.__enter__()
+        return self
+
+    def __exit__(self, exc_type, exc, tb) -> bool:
+        return bool(self._ctx.__exit__(exc_type, exc, tb))
+
+    def execute(self, sql: str, params: Optional[Any] = None) -> int:
+        from sqlalchemy import text as _sql_text
+        result = self._conn.execute(_sql_text(sql), params or {})
+        try:
+            return result.rowcount if result.rowcount is not None else 0
+        except Exception:
+            return 0
+
 # ---------------------------------------------------------------------------
 # SecureDBAdapter
 # ---------------------------------------------------------------------------
@@ -629,6 +659,71 @@ class SecureDBAdapter:
             return insp.get_columns(table, schema=schema)
         except Exception:
             return []
+
+    def execute(
+        self,
+        sql: str,
+        params: Optional[Any] = None,
+    ) -> int:
+        """
+        Executa DDL/DML arbitrário (INSERT, UPDATE, DELETE, CREATE, ALTER,
+        DROP, CREATE INDEX, etc.) — para operações que não retornam um
+        result set tabular (diferente de query(), que é para SELECT).
+
+        Uso típico de DBA: criar/alterar tabelas, índices, constraints,
+        rotinas de manutenção, sem precisar puxar dados para pandas/polars.
+
+        Args:
+            sql:    Instrução SQL (DDL ou DML).
+            params: Parâmetros vinculados (dict ou sequência), se houver.
+
+        Returns:
+            Número de linhas afetadas (0 para DDL sem contagem aplicável).
+
+        Exemplo:
+            banco.execute("CREATE INDEX idx_cpf ON clientes (cpf)")
+            banco.execute("DELETE FROM clientes WHERE uf = :uf", {"uf": "XX"})
+            banco.execute("ALTER TABLE clientes ADD COLUMN ativo BOOLEAN DEFAULT true")
+        """
+        from sqlalchemy import text as _sql_text
+        try:
+            with self._engine.begin() as conn:
+                result = conn.execute(_sql_text(sql), params or {})
+                try:
+                    return result.rowcount if result.rowcount is not None else 0
+                except Exception:
+                    return 0
+        except Exception as exc:
+            raise RuntimeError(f"Erro ao executar SQL: {type(exc).__name__}: {exc}") from None
+
+    def transaction(self):
+        """
+        Context manager de transação — agrupa múltiplos execute()/write()
+        em uma única transação (tudo ou nada).
+
+        Exemplo:
+            with banco.transaction() as tx:
+                tx.execute("UPDATE contas SET saldo = saldo - :v WHERE id = :o", {"v": 100, "o": 1})
+                tx.execute("UPDATE contas SET saldo = saldo + :v WHERE id = :d", {"v": 100, "d": 2})
+            # commit automático ao sair do bloco sem exceção;
+            # rollback automático se qualquer execute() levantar exceção.
+        """
+        return _DBTransaction(self._engine)
+
+    def drop_table(self, table: str, *, if_exists: bool = True) -> None:
+        """Remove uma tabela. if_exists=True evita erro se ela não existir."""
+        clause = "IF EXISTS " if if_exists else ""
+        self.execute(f"DROP TABLE {clause}{table}")
+
+    def create_index(
+        self, table: str, columns: Union[str, List[str]], *,
+        name: Optional[str] = None, unique: bool = False,
+    ) -> None:
+        """Cria um índice em uma ou mais colunas."""
+        cols = [columns] if isinstance(columns, str) else list(columns)
+        idx_name = name or f"idx_{table}_{'_'.join(cols)}"
+        uniq = "UNIQUE " if unique else ""
+        self.execute(f"CREATE {uniq}INDEX {idx_name} ON {table} ({', '.join(cols)})")
 
     def clear_cache(self) -> None:
         """Limpa o cache de schemas detectados."""
